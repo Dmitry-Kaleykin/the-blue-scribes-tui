@@ -1,0 +1,1388 @@
+import { spawnSync } from "node:child_process";
+import { readFile, readdir } from "node:fs/promises";
+import { basename, extname, resolve } from "node:path";
+
+import {
+    CombinedAutocompleteProvider,
+    Container,
+    Editor,
+    Key,
+    matchesKey,
+    ProcessTerminal,
+    Spacer,
+    Text,
+    TuiMainScreen,
+    type AutocompleteItem,
+    type SelectItem,
+    type SlashCommand,
+} from "@earendil-works/pi-tui";
+import {
+    CollectionService,
+    deleteIndexedProject,
+    IndexingPresetService,
+    listIndexedProjects,
+    managedProjectIdentifier,
+    ProjectIndexingService,
+    ProjectInspectionService,
+    ProjectRetrievalTargetService,
+    ProjectSearchService,
+    ProviderProfileService,
+    SqliteStorageProvider,
+    type IndexedProjectSummary,
+    type IndexingProgress,
+    type IndexingPreset,
+    type CollectionService as CollectionServiceType,
+    type CollectionSummary,
+    type ProjectIndexingEvent,
+    type ProviderProfile,
+    type RetrievalResult,
+} from "the-blue-scribes";
+
+import { commandHelp, COMMANDS } from "./commands.js";
+import { HeaderComponent } from "./components/header.js";
+import { IndexingProgressComponent } from "./components/indexing-progress.js";
+import { Picker } from "./components/picker.js";
+import { PromptLabelComponent } from "./components/prompt-label.js";
+import { SearchResultsComponent } from "./components/search-results.js";
+import { TextPrompt } from "./components/text-prompt.js";
+import type { ProjectPreference, ProjectPreferenceInput } from "./domain/project-preferences.js";
+import { ProjectPreferenceStore } from "./services/preference-store.js";
+import { projectForDirectory } from "./services/project-context.js";
+import { colors, editorTheme } from "./theme.js";
+
+interface ActiveJob {
+    root: string;
+    controller: AbortController;
+    startedAt: number;
+    progress?: IndexingProgress;
+}
+
+interface ProposedIndexConfiguration {
+    projectIdentifier: string;
+    root: string;
+    profile: string;
+    preset: string;
+    target: string;
+    keepReplacedBuilds: number;
+    allowDirty: boolean;
+    presetValue: IndexingPreset;
+}
+
+export interface ScribesTuiAppOptions {
+    cwd?: string;
+    preferences?: ProjectPreferenceStore;
+}
+
+export class ScribesTuiApp {
+    readonly #cwd: string;
+    readonly #preferences: ProjectPreferenceStore;
+    readonly #profiles = new ProviderProfileService(apiKeyOptions());
+    readonly #presets = new IndexingPresetService();
+    readonly #indexing = new ProjectIndexingService(apiKeyOptions());
+    readonly #search = new ProjectSearchService(apiKeyOptions());
+    readonly #inspection = new ProjectInspectionService();
+    readonly #targets = new ProjectRetrievalTargetService();
+    readonly #ui = new TuiMainScreen(new ProcessTerminal());
+    readonly #header = new HeaderComponent();
+    readonly #transcript = new Container();
+    readonly #progressArea = new Container();
+    readonly #editorArea = new Container();
+    readonly #promptLabel = new PromptLabelComponent();
+    readonly #editor = new Editor(this.#ui, editorTheme, {
+        paddingX: 1,
+        autocompleteMaxVisible: 10,
+    });
+    readonly #footer = new Text(colors.muted("/ commands · plain text searches · ↑↓ history · Ctrl+C twice exits"), 0, 0);
+    #projects: readonly IndexedProjectSummary[] = [];
+    #activeProject: IndexedProjectSummary | undefined;
+    #activePreference: ProjectPreference | undefined;
+    #activeJob: ActiveJob | undefined;
+    #progress: IndexingProgressComponent | undefined;
+    #progressTimer: NodeJS.Timeout | undefined;
+    #lastInterrupt = 0;
+    #stopping = false;
+    #modalActive = false;
+    #cancelPromptActive = false;
+    #resolveRun?: () => void;
+
+    constructor(options: ScribesTuiAppOptions = {}) {
+        this.#cwd = resolve(options.cwd ?? process.cwd());
+        this.#preferences = options.preferences ?? new ProjectPreferenceStore();
+        this.#editor.setAutocompleteProvider(
+            new CombinedAutocompleteProvider(this.#autocompleteCommands(), this.#cwd),
+        );
+        this.#editor.onSubmit = (text) => {
+            void this.#submit(text);
+        };
+        this.#editorArea.addChild(this.#promptLabel);
+        this.#editorArea.addChild(this.#editor);
+        this.#editorArea.addChild(this.#footer);
+        this.#ui.addChild(this.#header);
+        this.#ui.addChild(new Spacer(1));
+        this.#ui.addChild(this.#transcript);
+        this.#ui.addChild(this.#progressArea);
+        this.#ui.addChild(this.#editorArea);
+        this.#ui.addInputListener((data) => this.#handleGlobalInput(data));
+    }
+
+    async run(): Promise<void> {
+        await this.#refreshProjects();
+        this.#append(
+            this.#activeProject
+                ? `Ready in ${basename(this.#activeProject.root ?? this.#activeProject.projectIdentifier)}. Type a question to search or / for commands.`
+                : "No indexed project was found here. Use /index to create one or /project to choose an existing project.",
+            "muted",
+        );
+        this.#ui.terminal.setTitle("The Blue Scribes");
+        this.#ui.setFocus(this.#editor);
+        this.#ui.start();
+        return new Promise<void>((resolveRun) => {
+            this.#resolveRun = resolveRun;
+        });
+    }
+
+    async #submit(raw: string): Promise<void> {
+        const text = raw.trim();
+        if (!text) return;
+        this.#editor.addToHistory(text);
+        this.#editor.setText("");
+        if (!text.startsWith("/")) {
+            await this.#runSearch(text);
+            return;
+        }
+        const [name = "", ...arguments_] = text.slice(1).split(/\s+/u);
+        const argument = arguments_.join(" ").trim();
+        try {
+            await this.#runCommand(name.toLowerCase(), argument);
+        } catch (error: unknown) {
+            this.#appendError(error);
+        }
+    }
+
+    async #runCommand(name: string, argument: string): Promise<void> {
+        switch (name) {
+            case "index": await this.#configureAndIndex(); break;
+            case "project": await this.#selectProject(argument); break;
+            case "search": await this.#promptSearch(); break;
+            case "profile": await this.#manageProfiles(argument); break;
+            case "preset": await this.#managePresets(argument); break;
+            case "builds": await this.#browseBuilds(); break;
+            case "target": await this.#manageTargets(); break;
+            case "chunks": await this.#inspectChunks(argument); break;
+            case "collection": await this.#manageCollections(); break;
+            case "jobs": this.#showJobs(); break;
+            case "mcp": await this.#showMcp(); break;
+            case "doctor": await this.#doctor(); break;
+            case "settings": this.#showSettings(); break;
+            case "help": this.#append(commandHelp()); break;
+            case "clear": this.#transcript.clear(); this.#ui.requestRender(true); break;
+            case "quit": await this.#quit(); break;
+            default: this.#append(`Unknown command /${name}. Type /help to see available commands.`, "warning");
+        }
+    }
+
+    async #runSearch(query: string): Promise<void> {
+        if (!this.#activeProject) {
+            this.#append("Choose an indexed project with /project, or create one with /index.", "warning");
+            return;
+        }
+        const profile = await this.#searchProfile();
+        if (!profile) {
+            this.#append("This project has no provider profile. Use /profile to select one.", "warning");
+            return;
+        }
+        this.#promptLabel.setState(this.#activeProject.root, true);
+        this.#ui.requestRender();
+        try {
+            const response = await this.#search.search({
+                query,
+                projectReference: this.#activeProject.projectIdentifier,
+                profile,
+                limit: 10,
+                context: { beforeChunks: 1, afterChunks: 1, maximumCharacters: 12_000 },
+                reranking: { enabled: true, failureMode: "use-semantic-order" },
+            }, this.#cwd);
+            const component = new SearchResultsComponent({
+                query,
+                results: response.results,
+                requestRender: () => this.#ui.requestRender(),
+                onDone: () => this.#ui.setFocus(this.#editor),
+                onOpen: (result) => this.#openSearchResult(result),
+            });
+            this.#transcript.addChild(component);
+            this.#transcript.addChild(new Spacer(1));
+            if (response.results.length > 0) this.#ui.setFocus(component);
+        } finally {
+            this.#promptLabel.setState(this.#activeProject.root, false);
+            this.#ui.requestRender();
+        }
+    }
+
+    async #promptSearch(): Promise<void> {
+        const query = await this.#input("Search the active project", "Query");
+        if (query?.trim()) await this.#runSearch(query.trim());
+    }
+
+    async #configureAndIndex(): Promise<void> {
+        if (this.#activeJob) {
+            this.#append(`An index is already running for ${basename(this.#activeJob.root)}.`, "warning");
+            return;
+        }
+        const root = this.#activeProject?.root ?? detectProjectRoot(this.#cwd);
+        const profiles = await this.#profiles.list();
+        const presets = await this.#presets.list();
+        if (profiles.length === 0) {
+            this.#append("Create a provider profile with /profile before indexing.", "warning");
+            return;
+        }
+        if (presets.length === 0) {
+            this.#append("Create an indexing preset with /preset before indexing.", "warning");
+            return;
+        }
+
+        let profileName = this.#activePreference?.profile;
+        let presetName = this.#activePreference?.preset;
+        if (!profiles.some(({ name }) => name === profileName)) profileName = undefined;
+        if (!presets.some(({ name }) => name === presetName)) presetName = undefined;
+        if (!profileName) profileName = await this.#pickProfile(profiles, "Select provider profile") ?? undefined;
+        if (!profileName) return;
+        if (!presetName) presetName = await this.#pickPreset(presets, "Select indexing preset") ?? undefined;
+        if (!presetName) return;
+
+        const action = await this.#pick("Index project", [
+            { value: "start", label: "Start indexing", description: `${profileName} · ${presetName}` },
+            { value: "profile", label: "Change profile", description: profileName },
+            { value: "preset", label: "Change preset", description: presetName },
+            { value: "cancel", label: "Cancel" },
+        ]);
+        if (!action || action.value === "cancel") return;
+        if (action.value === "profile") {
+            profileName = await this.#pickProfile(profiles, "Select provider profile") ?? profileName;
+        } else if (action.value === "preset") {
+            presetName = await this.#pickPreset(presets, "Select indexing preset") ?? presetName;
+        }
+
+        const presetValue = presets.find(({ name }) => name === presetName)!;
+        const configuration: ProposedIndexConfiguration = {
+            projectIdentifier: this.#activeProject?.projectIdentifier ?? managedProjectIdentifier(root),
+            root,
+            profile: profileName,
+            preset: presetName,
+            target: this.#activePreference?.target ?? "main",
+            keepReplacedBuilds: this.#activePreference?.keepReplacedBuilds ?? 1,
+            allowDirty: this.#activePreference?.allowDirty ?? false,
+            presetValue,
+        };
+        void this.#startIndex(configuration);
+    }
+
+    async #startIndex(configuration: ProposedIndexConfiguration): Promise<void> {
+        const controller = new AbortController();
+        this.#activeJob = { root: configuration.root, controller, startedAt: Date.now() };
+        this.#progress = new IndexingProgressComponent();
+        this.#progress.setState({ stage: "provider", message: `Checking profile ${configuration.profile}` });
+        this.#progressArea.addChild(this.#progress);
+        this.#progressTimer = setInterval(() => {
+            this.#progress?.tick();
+            this.#ui.requestRender();
+        }, 90);
+        this.#updateHeader();
+        this.#ui.terminal.setProgress(true);
+        this.#ui.requestRender();
+
+        try {
+            const outcome = await this.#indexing.index({
+                root: configuration.root,
+                provider: { type: "profile", profile: configuration.profile },
+                target: configuration.target,
+                keepReplacedBuilds: configuration.keepReplacedBuilds ?? 1,
+                ...(configuration.allowDirty === true ? { allowDirty: true } : {}),
+                ...(configuration.presetValue.maximumChunkSize === undefined
+                    ? {}
+                    : { maximumChunkSize: configuration.presetValue.maximumChunkSize }),
+                ...(configuration.presetValue.windows1251 === undefined
+                    ? {}
+                    : { windows1251: configuration.presetValue.windows1251 }),
+                ...(configuration.presetValue.include === undefined
+                    ? {}
+                    : { include: configuration.presetValue.include }),
+                ...(configuration.presetValue.exclude === undefined
+                    ? {}
+                    : { exclude: configuration.presetValue.exclude }),
+                signal: controller.signal,
+                onEvent: (event) => this.#onIndexEvent(event),
+            });
+            await this.#preferences.set({
+                ...configuration,
+                projectIdentifier: outcome.project?.projectIdentifier ?? configuration.projectIdentifier,
+            });
+            const elapsed = formatDuration(Date.now() - this.#activeJob.startedAt);
+            this.#append(
+                `✓ Indexed ${basename(configuration.root)} in ${elapsed}\n` +
+                `  ${outcome.result.discoveredFiles.toLocaleString()} files · ` +
+                `${outcome.result.indexedChunks.toLocaleString()} chunks · ` +
+                `${outcome.result.reusedEmbeddings.toLocaleString()} embeddings reused · ` +
+                `build ${outcome.result.indexBuildId.slice(0, 12)}…`,
+                "success",
+            );
+        } catch (error: unknown) {
+            if (controller.signal.aborted) {
+                this.#append(`Indexing ${basename(configuration.root)} was cancelled.`, "warning");
+            } else {
+                this.#appendError(error);
+            }
+        } finally {
+            this.#stopProgress();
+            this.#activeJob = undefined;
+            await this.#refreshProjects(configuration.projectIdentifier);
+            this.#ui.terminal.setProgress(false);
+            this.#ui.requestRender();
+        }
+    }
+
+    #onIndexEvent(event: ProjectIndexingEvent): void {
+        if (!this.#progress || !this.#activeJob) return;
+        if (event.type === "provider-diagnostic") {
+            this.#progress.setState({
+                stage: "provider",
+                message: event.state === "started"
+                    ? `Checking ${event.model}`
+                    : "Provider ready",
+            });
+        } else if (event.type === "indexing-progress") {
+            this.#activeJob.progress = event.progress;
+            this.#progress.setState({ stage: "indexing", progress: event.progress });
+        } else if (event.type === "target-publication") {
+            this.#progress.setState({ stage: "provider", message: `Publishing target ${event.target}` });
+        }
+        this.#ui.requestRender();
+    }
+
+    #stopProgress(): void {
+        if (this.#progressTimer) clearInterval(this.#progressTimer);
+        this.#progressTimer = undefined;
+        this.#progressArea.clear();
+        this.#progress = undefined;
+    }
+
+    async #selectProject(argument = ""): Promise<void> {
+        await this.#refreshProjects();
+        if (argument === "info") {
+            const project = this.#requiredProject();
+            this.#append(JSON.stringify({
+                ...project,
+                preference: this.#activePreference ?? null,
+            }, null, 2));
+            return;
+        }
+        if (argument === "forget") {
+            const project = this.#requiredProject();
+            const name = basename(project.root ?? project.projectIdentifier);
+            if (!await this.#confirm(`Forget ${name}? Source files will not be touched.`, false)) return;
+            await deleteIndexedProject(project.projectIdentifier);
+            await this.#preferences.remove(project.projectIdentifier);
+            this.#activeProject = undefined;
+            this.#activePreference = undefined;
+            await this.#refreshProjects();
+            this.#append(`Removed the managed index for ${name}.`, "success");
+            return;
+        }
+        if (this.#projects.length === 0) {
+            this.#append("No indexed projects are available. Run /index in a project first.", "warning");
+            return;
+        }
+        const direct = argument
+            ? this.#projects.find((project) =>
+                project.projectIdentifier === argument ||
+                project.root === resolve(argument) ||
+                basename(project.root ?? project.projectIdentifier) === argument
+            )
+            : undefined;
+        const selected = direct ? {
+            value: direct.projectIdentifier,
+            label: basename(direct.root ?? direct.projectIdentifier),
+        } : await this.#pick("Select project", this.#projects.map((project) => ({
+            value: project.projectIdentifier,
+            label: basename(project.root ?? project.projectIdentifier),
+            description: project.latestReadyBuild
+                ? `${project.latestReadyBuild.model} · ${relativeTime(project.latestReadyBuild.completedAt)}`
+                : `${project.buildCount} builds · no ready build`,
+        })));
+        if (!selected) return;
+        await this.#refreshProjects(selected.value);
+        this.#append(`Switched to ${basename(this.#activeProject?.root ?? selected.value)}.`, "success");
+    }
+
+    #autocompleteCommands(): SlashCommand[] {
+        return COMMANDS.map((command) => {
+            if (command.name === "project") {
+                return {
+                    ...command,
+                    argumentHint: "[project|info|forget]",
+                    getArgumentCompletions: (prefix: string) => [
+                        { value: "info", label: "info", description: "Show active project details" },
+                        { value: "forget", label: "forget", description: "Remove the managed index" },
+                        ...this.#projects.map((project) => ({
+                            value: project.projectIdentifier,
+                            label: basename(project.root ?? project.projectIdentifier),
+                            ...(project.root === undefined ? {} : { description: project.root }),
+                        })),
+                    ].filter((item) => `${item.value} ${item.label} ${item.description ?? ""}`.toLowerCase().includes(prefix.toLowerCase())),
+                };
+            }
+            if (command.name === "profile") {
+                return {
+                    ...command,
+                    argumentHint: "[profile]",
+                    getArgumentCompletions: async (prefix: string) => (await this.#profiles.list())
+                        .filter((profile) => `${profile.name} ${profile.embedding.model}`.toLowerCase().includes(prefix.toLowerCase()))
+                        .map((profile) => ({
+                            value: profile.name,
+                            label: profile.name,
+                            description: profile.embedding.model,
+                        })),
+                };
+            }
+            if (command.name === "preset") {
+                return {
+                    ...command,
+                    argumentHint: "[preset]",
+                    getArgumentCompletions: async (prefix: string) => (await this.#presets.list())
+                        .filter((preset) => preset.name.toLowerCase().includes(prefix.toLowerCase()))
+                        .map((preset) => ({
+                            value: preset.name,
+                            label: preset.name,
+                            description: `${preset.maximumChunkSize ?? "default"} chars`,
+                        })),
+                };
+            }
+            if (command.name === "chunks") {
+                return {
+                    ...command,
+                    getArgumentCompletions: (prefix: string) => this.#fileCompletions(prefix),
+                };
+            }
+            return { ...command };
+        });
+    }
+
+    async #fileCompletions(prefix: string): Promise<AutocompleteItem[]> {
+        const root = this.#activeProject?.root;
+        if (!root) return [];
+        try {
+            const entries = await readdir(root, { recursive: true });
+            const normalizedPrefix = prefix.toLowerCase();
+            return entries
+                .filter((entry) =>
+                    !entry.startsWith(".git/") &&
+                    !entry.includes("/node_modules/") &&
+                    !entry.startsWith("node_modules/") &&
+                    entry.toLowerCase().includes(normalizedPrefix)
+                )
+                .slice(0, 300)
+                .map((entry) => ({ value: entry, label: entry }));
+        } catch {
+            return [];
+        }
+    }
+
+    async #manageProfiles(argument = ""): Promise<void> {
+        const profiles = await this.#profiles.list();
+        const direct = argument ? profiles.find(({ name }) => name === argument) : undefined;
+        const selection = direct ? { value: direct.name, label: direct.name } : await this.#pick("Provider profiles", [
+            { value: "__create", label: "+ Create profile", description: "Discover an LM Studio model" },
+            ...profiles.map((profile) => ({
+                value: profile.name,
+                label: profile.name,
+                description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions`,
+            })),
+        ]);
+        if (!selection) return;
+        if (selection.value === "__create") {
+            await this.#createProfile();
+            return;
+        }
+        const profile = profiles.find(({ name }) => name === selection.value)!;
+        const action = await this.#pick(profile.name, [
+            { value: "use", label: "Use for current project" },
+            { value: "test", label: "Test connection" },
+            { value: "edit", label: "Edit profile" },
+            { value: "show", label: "Show configuration" },
+            { value: "delete", label: "Delete profile" },
+        ]);
+        if (!action) return;
+        if (action.value === "use") {
+            if (!this.#activeProject || !this.#activePreference) {
+                this.#append("Select a preset during /index before changing an existing project profile.", "warning");
+                return;
+            }
+            this.#activePreference = await this.#preferences.set({ ...this.#activePreference, profile: profile.name });
+            this.#append(`Project profile changed to ${profile.name}.`, "success");
+            this.#updateHeader();
+        } else if (action.value === "test") {
+            this.#append("Testing provider…", "muted");
+            this.#append(JSON.stringify(await this.#profiles.diagnose(profile.name), null, 2), "success");
+        } else if (action.value === "edit") {
+            await this.#editProfile(profile);
+        } else if (action.value === "show") {
+            this.#append(JSON.stringify(profile, null, 2));
+        } else if (action.value === "delete") {
+            const used = (await this.#preferences.list()).filter(({ profile: value }) => value === profile.name);
+            if (used.length > 0) {
+                this.#append(`Profile ${profile.name} is used by ${used.length} project(s) and cannot be deleted.`, "warning");
+                return;
+            }
+            if (await this.#confirm(`Delete profile ${profile.name}?`)) {
+                await this.#profiles.remove(profile.name);
+                this.#append(`Deleted profile ${profile.name}.`, "success");
+            }
+        }
+    }
+
+    async #createProfile(): Promise<void> {
+        const name = (await this.#input("Create provider profile", "Name"))?.trim();
+        if (!name) return;
+        this.#append("Discovering LM Studio models…", "muted");
+        const models = await this.#profiles.listLmStudioModels();
+        if (models.length === 0) throw new Error("LM Studio did not return any models");
+        const selected = await this.#pick("Select embedding model", models.map((model) => ({
+            value: model.id,
+            label: model.id,
+            ...(model.ownedBy === undefined ? {} : { description: model.ownedBy }),
+        })));
+        if (!selected) return;
+        const inspection = await this.#profiles.inspectLmStudioEmbeddingModel(selected.value);
+        const saved = await this.#profiles.set({
+            name,
+            embedding: {
+                provider: "lm-studio",
+                model: selected.value,
+                dimensions: inspection.dimensions,
+            },
+        });
+        this.#append(`Created profile ${saved.name} with ${inspection.dimensions} dimensions.`, "success");
+    }
+
+    async #editProfile(profile: ProviderProfile): Promise<void> {
+        const baseUrl = (await this.#input(
+            `Edit ${profile.name}`,
+            "LM Studio URL",
+            profile.embedding.baseUrl ?? "http://127.0.0.1:1234/v1",
+        ))?.trim();
+        if (baseUrl === undefined) return;
+        const model = (await this.#input(
+            `Edit ${profile.name}`,
+            "Embedding model",
+            profile.embedding.model,
+        ))?.trim();
+        if (!model) return;
+        const dimensionsText = await this.#input(
+            `Edit ${profile.name}`,
+            "Dimensions",
+            String(profile.embedding.dimensions),
+        );
+        if (dimensionsText === undefined) return;
+        const dimensions = Number.parseInt(dimensionsText, 10);
+        if (!Number.isSafeInteger(dimensions) || dimensions < 1) {
+            throw new Error("Embedding dimensions must be a positive integer");
+        }
+        const rerankingModel = (await this.#input(
+            `Edit ${profile.name}`,
+            "Reranker (empty disables)",
+            profile.reranking?.model ?? "",
+        ))?.trim();
+        if (rerankingModel === undefined) return;
+        await this.#profiles.set({
+            name: profile.name,
+            embedding: {
+                provider: "lm-studio",
+                model,
+                dimensions,
+                ...(baseUrl ? { baseUrl } : {}),
+                ...(profile.embedding.maximumInputs === undefined
+                    ? {}
+                    : { maximumInputs: profile.embedding.maximumInputs }),
+                ...(profile.embedding.embeddingSuffix === undefined
+                    ? {}
+                    : { embeddingSuffix: profile.embedding.embeddingSuffix }),
+            },
+            ...(rerankingModel
+                ? {
+                    reranking: {
+                        provider: "lm-studio-qwen3" as const,
+                        model: rerankingModel,
+                        ...(baseUrl ? { baseUrl } : {}),
+                        ...(profile.reranking?.instruction === undefined
+                            ? {}
+                            : { instruction: profile.reranking.instruction }),
+                    },
+                }
+                : {}),
+        });
+        this.#append(`Updated profile ${profile.name}.`, "success");
+    }
+
+    async #managePresets(argument = ""): Promise<void> {
+        const presets = await this.#presets.list();
+        const direct = argument ? presets.find(({ name }) => name === argument) : undefined;
+        const selection = direct ? { value: direct.name, label: direct.name } : await this.#pick("Indexing presets", [
+            { value: "__create", label: "+ Create preset", description: "Define code indexing rules" },
+            ...presets.map((preset) => ({
+                value: preset.name,
+                label: preset.name,
+                description: `${preset.maximumChunkSize ?? "default"} chars · ${preset.exclude?.length ?? 0} excludes`,
+            })),
+        ]);
+        if (!selection) return;
+        if (selection.value === "__create") {
+            await this.#createPreset();
+            return;
+        }
+        const preset = presets.find(({ name }) => name === selection.value)!;
+        const action = await this.#pick(preset.name, [
+            { value: "use", label: "Use for current project" },
+            { value: "edit", label: "Edit preset" },
+            { value: "show", label: "Show configuration" },
+            { value: "delete", label: "Delete preset" },
+        ]);
+        if (!action) return;
+        if (action.value === "use") {
+            if (!this.#activeProject || !this.#activePreference) {
+                this.#append("Select a profile during /index before changing an existing project preset.", "warning");
+                return;
+            }
+            this.#activePreference = await this.#preferences.set({ ...this.#activePreference, preset: preset.name });
+            this.#append(`Project preset changed to ${preset.name}.`, "success");
+            this.#updateHeader();
+        } else if (action.value === "edit") {
+            await this.#editPreset(preset);
+        } else if (action.value === "show") {
+            this.#append(JSON.stringify(preset, null, 2));
+        } else if (action.value === "delete") {
+            const used = (await this.#preferences.list()).filter(({ preset: value }) => value === preset.name);
+            if (used.length > 0) {
+                this.#append(`Preset ${preset.name} is used by ${used.length} project(s) and cannot be deleted.`, "warning");
+                return;
+            }
+            if (await this.#confirm(`Delete preset ${preset.name}?`)) {
+                await this.#presets.remove(preset.name);
+                this.#append(`Deleted preset ${preset.name}.`, "success");
+            }
+        }
+    }
+
+    async #createPreset(): Promise<void> {
+        const name = (await this.#input("Create indexing preset", "Name"))?.trim();
+        if (!name) return;
+        const profiles = await this.#profiles.list();
+        if (profiles.length === 0) throw new Error("Create a provider profile before creating a preset");
+        const compatibilityProfile = this.#activePreference?.profile ?? profiles[0]!.name;
+        const chunkText = await this.#input("Maximum chunk size", "Characters", "3000");
+        if (chunkText === undefined) return;
+        const maximumChunkSize = Number.parseInt(chunkText, 10);
+        if (!Number.isSafeInteger(maximumChunkSize) || maximumChunkSize < 1) {
+            throw new Error("Maximum chunk size must be a positive integer");
+        }
+        const windows1251 = await this.#confirm("Enable Windows-1251 fallback?", false);
+        const saved = await this.#presets.set({
+            name,
+            providerProfile: compatibilityProfile,
+            maximumChunkSize,
+            windows1251,
+        });
+        this.#append(`Created preset ${saved.name}.`, "success");
+    }
+
+    async #editPreset(preset: IndexingPreset): Promise<void> {
+        const chunkText = await this.#input(
+            `Edit ${preset.name}`,
+            "Maximum chunk size",
+            String(preset.maximumChunkSize ?? 3_000),
+        );
+        if (chunkText === undefined) return;
+        const maximumChunkSize = Number.parseInt(chunkText, 10);
+        if (!Number.isSafeInteger(maximumChunkSize) || maximumChunkSize < 1) {
+            throw new Error("Maximum chunk size must be a positive integer");
+        }
+        const includeText = await this.#input(
+            `Edit ${preset.name}`,
+            "Include globs (comma separated)",
+            preset.include?.join(", ") ?? "",
+        );
+        if (includeText === undefined) return;
+        const excludeText = await this.#input(
+            `Edit ${preset.name}`,
+            "Exclude globs (comma separated)",
+            preset.exclude?.join(", ") ?? "",
+        );
+        if (excludeText === undefined) return;
+        const windows1251 = await this.#confirm(
+            "Enable Windows-1251 fallback?",
+            preset.windows1251 === true,
+        );
+        await this.#presets.set({
+            name: preset.name,
+            providerProfile: preset.providerProfile,
+            maximumChunkSize,
+            windows1251,
+            ...(splitPatterns(includeText).length === 0 ? {} : { include: splitPatterns(includeText) }),
+            ...(splitPatterns(excludeText).length === 0 ? {} : { exclude: splitPatterns(excludeText) }),
+        });
+        this.#append(`Updated preset ${preset.name}.`, "success");
+    }
+
+    async #browseBuilds(): Promise<void> {
+        const project = this.#requiredProject();
+        const storage = new SqliteStorageProvider(project.databasePath, { readOnly: true, immutable: true });
+        try {
+            const builds = await storage.listBuilds();
+            if (builds.length === 0) {
+                this.#append("This project has no builds.", "muted");
+                return;
+            }
+            const selection = await this.#pick("Build history", builds.map((build) => ({
+                value: build.indexBuildId,
+                label: `${build.indexBuildId.slice(0, 12)}  ${build.status}`,
+                description: `${build.modelIdentity.model} · ${relativeTime(build.completedAt ?? build.createdAt)}`,
+            })));
+            const build = builds.find(({ indexBuildId }) => indexBuildId === selection?.value);
+            if (build) this.#append(JSON.stringify(build, null, 2));
+        } finally {
+            await storage.close();
+        }
+    }
+
+    async #manageTargets(): Promise<void> {
+        const project = this.#requiredProject();
+        const listing = await this.#targets.list(project.projectIdentifier, this.#cwd);
+        const targets = Array.isArray(listing.targets) ? listing.targets.filter(isRecord) : [];
+        if (targets.length === 0) {
+            this.#append("This project has no named retrieval targets.", "muted");
+            return;
+        }
+        const selection = await this.#pick("Retrieval targets", targets.map((target) => ({
+            value: String(target.name),
+            label: `${target.active === true ? "●" : "○"} ${String(target.name)}`,
+            description: String(target.indexBuildId ?? ""),
+        })));
+        if (!selection) return;
+        const action = await this.#pick(selection.label, [
+            { value: "switch", label: "Make active" },
+            { value: "rename", label: "Rename" },
+            { value: "remove", label: "Remove target" },
+        ]);
+        if (!action) return;
+        if (action.value === "switch") {
+            await this.#targets.switchTarget(project.projectIdentifier, selection.value, this.#cwd);
+            this.#append(`Activated target ${selection.value}.`, "success");
+        } else if (action.value === "rename") {
+            const next = (await this.#input(`Rename ${selection.value}`, "New name", selection.value))?.trim();
+            if (next && next !== selection.value) {
+                await this.#targets.renameTarget(project.projectIdentifier, selection.value, next, this.#cwd);
+                this.#append(`Renamed ${selection.value} to ${next}.`, "success");
+            }
+        } else if (action.value === "remove" && await this.#confirm(`Remove target ${selection.value}?`)) {
+            await this.#targets.removeTarget(project.projectIdentifier, selection.value, this.#cwd);
+            this.#append(`Removed target ${selection.value}.`, "success");
+        }
+    }
+
+    async #inspectChunks(argument: string): Promise<void> {
+        const project = this.#requiredProject();
+        const path = argument || await this.#input("Inspect indexed chunks", "Relative path");
+        if (!path?.trim()) return;
+        const result = await this.#inspection.chunks({
+            projectReference: project.projectIdentifier,
+            path: path.trim(),
+        }, this.#cwd);
+        const lines = result.chunks.chunks.map((chunk, index) => {
+            return [
+                `Chunk ${index + 1} · lines ${chunk.metadata.startLine}–${chunk.metadata.endLine}`,
+                chunk.content,
+            ].join("\n");
+        });
+        this.#append(`${path.trim()} · build ${result.indexBuildId.slice(0, 12)}\n\n${lines.join("\n\n")}`);
+    }
+
+    async #manageCollections(): Promise<void> {
+        const context = await this.#collectionService();
+        if (!context) return;
+        const { service, profileName } = context;
+        const collections = await service.listCollections();
+        const selection = await this.#pick("Document collections", [
+            { value: "__create", label: "+ Create collection", description: "Create an externally managed document set" },
+            ...collections.map((collection) => ({
+                value: collection.collectionId,
+                label: collection.name,
+                description: `${collection.sourceCount} sources · ${collection.needsBuild ? "build required" : "ready"}`,
+            })),
+        ]);
+        if (!selection) return;
+        if (selection.value === "__create") {
+            const name = (await this.#input("Create document collection", "Name"))?.trim();
+            if (!name) return;
+            const created = await service.createCollection(name);
+            this.#append(`Created collection ${created.name}.`, "success");
+            return;
+        }
+        const collection = collections.find(({ collectionId }) => collectionId === selection.value)!;
+        const action = await this.#pick(collection.name, [
+            { value: "search", label: "Search collection" },
+            { value: "index", label: "Index collection", description: profileName },
+            { value: "sources", label: "Browse sources", description: `${collection.sourceCount} sources` },
+            { value: "add", label: "Add local files" },
+            { value: "delete", label: "Delete collection" },
+        ]);
+        if (!action) return;
+        if (action.value === "search") {
+            await this.#searchCollection(service, collection);
+        } else if (action.value === "index") {
+            await this.#configureCollectionIndex(service, collection, profileName);
+        } else if (action.value === "sources") {
+            await this.#manageCollectionSources(service, collection);
+        } else if (action.value === "add") {
+            await this.#addCollectionSources(service, collection);
+        } else if (action.value === "delete" && await this.#confirm(`Delete collection ${collection.name}?`, false)) {
+            await service.deleteCollection(collection.collectionId);
+            this.#append(`Deleted collection ${collection.name}.`, "success");
+        }
+    }
+
+    async #collectionService(): Promise<{
+        service: CollectionServiceType;
+        profileName: string;
+    } | undefined> {
+        const profiles = await this.#profiles.list();
+        const profileName = await this.#searchProfile() ?? profiles[0]?.name;
+        if (!profileName) {
+            this.#append("Create a provider profile before using collections.", "warning");
+            return undefined;
+        }
+        const profile = await this.#profiles.get(profileName);
+        const rerankingProvider = this.#profiles.createRerankingProvider(profile);
+        return {
+            profileName,
+            service: new CollectionService({
+                embeddingProvider: this.#profiles.createEmbeddingProvider(profile),
+                ...(rerankingProvider === undefined ? {} : { rerankingProvider }),
+            }),
+        };
+    }
+
+    async #searchCollection(service: CollectionServiceType, collection: CollectionSummary): Promise<void> {
+        const query = await this.#input(`Search ${collection.name}`, "Query");
+        if (!query?.trim()) return;
+        const results = await service.retrieve(collection.collectionId, {
+            query: query.trim(),
+            limit: 10,
+            context: { beforeChunks: 1, afterChunks: 1, maximumCharacters: 12_000 },
+            rerank: { candidateLimit: 30, failureMode: "use-semantic-order" },
+        });
+        const component = new SearchResultsComponent({
+            query: query.trim(),
+            results,
+            requestRender: () => this.#ui.requestRender(),
+            onDone: () => this.#ui.setFocus(this.#editor),
+        });
+        this.#transcript.addChild(component);
+        this.#transcript.addChild(new Spacer(1));
+        if (results.length > 0) this.#ui.setFocus(component);
+    }
+
+    async #configureCollectionIndex(
+        service: CollectionServiceType,
+        collection: CollectionSummary,
+        profileName: string,
+    ): Promise<void> {
+        if (this.#activeJob) {
+            this.#append(`An index is already running for ${basename(this.#activeJob.root)}.`, "warning");
+            return;
+        }
+        const presets = await this.#presets.list();
+        if (presets.length === 0) {
+            this.#append("Create an indexing preset with /preset before indexing a collection.", "warning");
+            return;
+        }
+        const preferredPreset = this.#activePreference?.preset;
+        const preset = presets.find(({ name }) => name === preferredPreset) ??
+            await this.#selectPresetValue(presets, "Select collection indexing preset");
+        if (!preset) return;
+        if (!await this.#confirm(`Index ${collection.name} with ${profileName} · ${preset.name}?`)) return;
+        void this.#startCollectionIndex(service, collection, preset);
+    }
+
+    async #selectPresetValue(
+        presets: readonly IndexingPreset[],
+        title: string,
+    ): Promise<IndexingPreset | undefined> {
+        const name = await this.#pickPreset(presets, title);
+        return presets.find((preset) => preset.name === name);
+    }
+
+    async #startCollectionIndex(
+        service: CollectionServiceType,
+        collection: CollectionSummary,
+        preset: IndexingPreset,
+    ): Promise<void> {
+        const controller = new AbortController();
+        this.#activeJob = {
+            root: `collection:${collection.name}`,
+            controller,
+            startedAt: Date.now(),
+        };
+        this.#progress = new IndexingProgressComponent();
+        this.#progress.setState({ stage: "provider", message: `Preparing ${collection.name}` });
+        this.#progressArea.addChild(this.#progress);
+        this.#progressTimer = setInterval(() => {
+            this.#progress?.tick();
+            this.#ui.requestRender();
+        }, 90);
+        this.#updateHeader();
+        this.#ui.terminal.setProgress(true);
+
+        try {
+            const sources = await service.listSources(collection.collectionId);
+            const sourcePaths = new Map(sources.map((source) => [source.sourceId, source.logicalPath]));
+            const result = await service.buildCollection(collection.collectionId, {
+                ...(preset.maximumChunkSize === undefined ? {} : { maximumChunkSize: preset.maximumChunkSize }),
+                ...(preset.windows1251 === true ? { encodingFallback: "windows-1251" as const } : {}),
+                signal: controller.signal,
+                onProgress: (progress) => {
+                    const mapped: IndexingProgress = {
+                        phase: progress.phase,
+                        completed: progress.completed,
+                        total: progress.total,
+                        ...(progress.currentSourceId === undefined
+                            ? {}
+                            : { currentPath: sourcePaths.get(progress.currentSourceId) ?? progress.currentSourceId }),
+                        discoveredFiles: sources.length,
+                        ...(progress.reusedDocuments === undefined ? {} : { reusedDocuments: progress.reusedDocuments }),
+                        ...(progress.reusedChunks === undefined ? {} : { reusedChunks: progress.reusedChunks }),
+                        ...(progress.reusedEmbeddings === undefined ? {} : { reusedEmbeddings: progress.reusedEmbeddings }),
+                        ...(progress.generatedEmbeddings === undefined ? {} : { generatedEmbeddings: progress.generatedEmbeddings }),
+                    };
+                    if (this.#activeJob) this.#activeJob.progress = mapped;
+                    this.#progress?.setState({ stage: "indexing", progress: mapped });
+                    this.#ui.requestRender();
+                },
+            });
+            this.#append(
+                `✓ Indexed collection ${collection.name} in ${formatDuration(Date.now() - this.#activeJob.startedAt)}\n` +
+                `  ${result.sourceCount} sources · ${result.indexedChunks} chunks · ` +
+                `${result.reusedEmbeddings} embeddings reused · build ${result.indexBuildId.slice(0, 12)}…`,
+                "success",
+            );
+        } catch (error: unknown) {
+            if (controller.signal.aborted) {
+                this.#append(`Indexing collection ${collection.name} was cancelled.`, "warning");
+            } else {
+                this.#appendError(error);
+            }
+        } finally {
+            this.#stopProgress();
+            this.#activeJob = undefined;
+            this.#ui.terminal.setProgress(false);
+            this.#updateHeader();
+            this.#ui.requestRender();
+        }
+    }
+
+    async #manageCollectionSources(service: CollectionServiceType, collection: CollectionSummary): Promise<void> {
+        const sources = await service.listSources(collection.collectionId);
+        if (sources.length === 0) {
+            this.#append(`Collection ${collection.name} has no sources.`, "muted");
+            return;
+        }
+        const selected = await this.#pick(`${collection.name} sources`, sources.map((source) => ({
+            value: source.sourceId,
+            label: source.logicalPath,
+            description: source.tags.length > 0 ? source.tags.join(", ") : `${source.byteLength} bytes`,
+        })));
+        if (!selected) return;
+        const source = sources.find(({ sourceId }) => sourceId === selected.value)!;
+        const action = await this.#pick(source.logicalPath, [
+            { value: "show", label: "Show source details" },
+            { value: "tags", label: "Set tags" },
+            { value: "remove", label: "Remove source" },
+        ]);
+        if (!action) return;
+        if (action.value === "show") {
+            this.#append(JSON.stringify(source, null, 2));
+        } else if (action.value === "tags") {
+            const tags = await this.#input("Set source tags", "Comma separated", source.tags.join(", "));
+            if (tags === undefined) return;
+            await service.setSourceTags(collection.collectionId, [source.sourceId], splitPatterns(tags));
+            this.#append(`Updated tags for ${source.logicalPath}.`, "success");
+        } else if (action.value === "remove" && await this.#confirm(`Remove ${source.logicalPath}?`, false)) {
+            await service.removeSources(collection.collectionId, [source.sourceId]);
+            this.#append(`Removed ${source.logicalPath} from ${collection.name}.`, "success");
+        }
+    }
+
+    async #addCollectionSources(service: CollectionServiceType, collection: CollectionSummary): Promise<void> {
+        const pathsText = await this.#input("Add local files", "Paths (comma separated)");
+        if (!pathsText?.trim()) return;
+        const paths = splitPatterns(pathsText).map((path) => resolve(this.#cwd, path));
+        const tagsText = await this.#input("Tags for added sources", "Comma separated", "");
+        if (tagsText === undefined) return;
+        const documents = await Promise.all(paths.map(async (path) => ({
+            externalId: path,
+            content: new Uint8Array(await readFile(path)),
+            logicalPath: basename(path),
+            title: basename(path),
+            mediaType: mediaTypeFor(path),
+            ...(splitPatterns(tagsText).length === 0 ? {} : { tags: splitPatterns(tagsText) }),
+            originalLocation: path,
+        })));
+        const manifest = await service.upsertDocuments(collection.collectionId, documents);
+        this.#append(`Added ${documents.length} source(s) to ${manifest.name}. Run /collection and choose Index collection.`, "success");
+    }
+
+    #showJobs(): void {
+        if (!this.#activeJob) {
+            this.#append("No indexing operation is running.", "muted");
+            return;
+        }
+        const progress = this.#activeJob.progress;
+        this.#append([
+            `Indexing ${this.#activeJob.root}`,
+            `Elapsed: ${formatDuration(Date.now() - this.#activeJob.startedAt)}`,
+            progress ? `Phase: ${progress.phase} · ${progress.completed ?? "?"}/${progress.total ?? "?"}` : "Checking provider",
+        ].join("\n"));
+    }
+
+    #openSearchResult(result: RetrievalResult): void {
+        const root = this.#activeProject?.root;
+        if (!root) {
+            this.#append("Only project search results can be opened in a local editor.", "warning");
+            return;
+        }
+        const specification = process.env.VISUAL?.trim() || process.env.EDITOR?.trim() || "nano";
+        const [command, ...configuredArguments] = specification.split(/\s+/u);
+        if (!command) return;
+        const path = resolve(root, result.path);
+        const editorName = basename(command);
+        const locationArguments = ["code", "code-insiders", "codium", "cursor"].includes(editorName)
+            ? ["--goto", `${path}:${result.range.startLine}`]
+            : [`+${result.range.startLine}`, path];
+        this.#ui.stop({ preserveScreen: true });
+        try {
+            spawnSync(command, [...configuredArguments, ...locationArguments], {
+                stdio: "inherit",
+            });
+        } finally {
+            this.#ui.start();
+            this.#ui.requestRender(true);
+        }
+    }
+
+    async #showMcp(): Promise<void> {
+        const project = this.#requiredProject();
+        const profile = this.#activePreference?.profile;
+        const configuration = JSON.stringify({
+            "the-blue-scribes": {
+                type: "stdio",
+                command: "scribes-mcp",
+                args: [
+                    "--project",
+                    project.root ?? project.projectIdentifier,
+                    ...(profile ? ["--profile", profile] : []),
+                    "--tools",
+                    "search_project",
+                ],
+            },
+        }, null, 2);
+        const action = await this.#pick("MCP configuration", [
+            { value: "copy", label: "Copy JSON", description: "Use terminal clipboard support" },
+            { value: "print", label: "Print JSON", description: "Leave configuration in scrollback" },
+        ]);
+        if (action?.value === "copy") {
+            this.#ui.terminal.write(`\u001b]52;c;${Buffer.from(configuration).toString("base64")}\u0007`);
+            this.#append("Copied MCP configuration to the clipboard.", "success");
+        } else if (action?.value === "print") {
+            this.#append(configuration);
+        }
+    }
+
+    async #doctor(): Promise<void> {
+        const profiles = await this.#profiles.list();
+        const selected = this.#activePreference?.profile ?? await this.#pickProfile(profiles, "Select profile to test");
+        if (!selected) return;
+        this.#append(`Testing ${selected}…`, "muted");
+        this.#append(JSON.stringify(await this.#profiles.diagnose(selected), null, 2), "success");
+    }
+
+    #showSettings(): void {
+        this.#append([
+            "Terminal interaction",
+            "",
+            "  /             open fuzzy command completion",
+            "  ↑ / ↓         navigate options or input history",
+            "  Enter         select or submit",
+            "  Tab           complete command or path",
+            "  Escape        close a selector; confirms before cancelling indexing",
+            "  Ctrl+C twice  quit",
+            "",
+            "Project preferences are stored outside repositories under ~/.blue-scribes/tui.",
+        ].join("\n"));
+    }
+
+    async #searchProfile(): Promise<string | undefined> {
+        if (this.#activePreference?.profile) return this.#activePreference.profile;
+        if (!this.#activeProject) return undefined;
+        try {
+            const recipe = await this.#indexing.recipe(this.#activeProject.projectIdentifier, this.#cwd);
+            return recipe?.provider.type === "profile" ? recipe.provider.profile : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
+    async #refreshProjects(preferredIdentifier?: string): Promise<void> {
+        this.#projects = await listIndexedProjects();
+        const identifier = preferredIdentifier ?? this.#activeProject?.projectIdentifier;
+        this.#activeProject = identifier
+            ? this.#projects.find(({ projectIdentifier }) => projectIdentifier === identifier)
+            : projectForDirectory(this.#projects, this.#cwd);
+        this.#activePreference = this.#activeProject
+            ? await this.#preferences.get(this.#activeProject.projectIdentifier)
+            : undefined;
+        this.#updateHeader();
+    }
+
+    #updateHeader(): void {
+        this.#header.setState({
+            ...(this.#activeProject === undefined ? {} : { project: this.#activeProject }),
+            ...(this.#activePreference === undefined ? {} : { preference: this.#activePreference }),
+            indexing: this.#activeJob !== undefined,
+        });
+        this.#promptLabel.setState(this.#activeProject?.root, false);
+        this.#ui.requestRender();
+    }
+
+    #append(message: string, tone: "normal" | "muted" | "success" | "warning" = "normal"): void {
+        const styled = tone === "muted" ? colors.muted(message)
+            : tone === "success" ? colors.success(message)
+                : tone === "warning" ? colors.warning(message)
+                    : message;
+        this.#transcript.addChild(new Text(styled, 0, 0));
+        this.#transcript.addChild(new Spacer(1));
+        this.#ui.requestRender();
+    }
+
+    #appendError(error: unknown): void {
+        const message = error instanceof Error ? error.message : String(error);
+        this.#append(`Error: ${message}`, "warning");
+    }
+
+    async #pick(title: string, items: readonly SelectItem[]): Promise<SelectItem | undefined> {
+        if (items.length === 0) return undefined;
+        return new Promise((resolveSelection) => {
+            this.#modalActive = true;
+            let settled = false;
+            const finish = (item?: SelectItem): void => {
+                if (settled) return;
+                settled = true;
+                this.#modalActive = false;
+                this.#ui.removeChild(picker);
+                this.#ui.addChild(this.#editorArea);
+                this.#ui.setFocus(this.#editor);
+                this.#ui.requestRender(true);
+                resolveSelection(item);
+            };
+            const picker = new Picker({
+                title,
+                items,
+                onSelect: (item) => finish(item),
+                onCancel: () => finish(),
+                requestRender: () => this.#ui.requestRender(),
+            });
+            this.#ui.removeChild(this.#editorArea);
+            this.#ui.addChild(picker);
+            this.#ui.setFocus(picker);
+            this.#ui.requestRender(true);
+        });
+    }
+
+    async #input(title: string, label: string, initialValue?: string): Promise<string | undefined> {
+        return new Promise((resolveInput) => {
+            this.#modalActive = true;
+            let settled = false;
+            const finish = (value?: string): void => {
+                if (settled) return;
+                settled = true;
+                this.#modalActive = false;
+                this.#ui.removeChild(prompt);
+                this.#ui.addChild(this.#editorArea);
+                this.#ui.setFocus(this.#editor);
+                this.#ui.requestRender(true);
+                resolveInput(value);
+            };
+            const prompt = new TextPrompt({
+                title,
+                label,
+                ...(initialValue === undefined ? {} : { initialValue }),
+                onSubmit: (value) => finish(value),
+                onCancel: () => finish(),
+                requestRender: () => this.#ui.requestRender(),
+            });
+            this.#ui.removeChild(this.#editorArea);
+            this.#ui.addChild(prompt);
+            this.#ui.setFocus(prompt);
+            this.#ui.requestRender(true);
+        });
+    }
+
+    async #confirm(title: string, defaultYes = true): Promise<boolean> {
+        const selected = await this.#pick(title, defaultYes ? [
+            { value: "yes", label: "Yes" },
+            { value: "no", label: "No" },
+        ] : [
+            { value: "no", label: "No" },
+            { value: "yes", label: "Yes" },
+        ]);
+        return selected?.value === "yes";
+    }
+
+    async #pickProfile(profiles: readonly ProviderProfile[], title: string): Promise<string | undefined> {
+        const selection = await this.#pick(title, profiles.map((profile) => ({
+            value: profile.name,
+            label: profile.name,
+            description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions`,
+        })));
+        return selection?.value;
+    }
+
+    async #pickPreset(presets: readonly IndexingPreset[], title: string): Promise<string | undefined> {
+        const selection = await this.#pick(title, presets.map((preset) => ({
+            value: preset.name,
+            label: preset.name,
+            description: `${preset.maximumChunkSize ?? "default"} chars · ${preset.exclude?.length ?? 0} excludes`,
+        })));
+        return selection?.value;
+    }
+
+    #requiredProject(): IndexedProjectSummary {
+        if (!this.#activeProject) throw new Error("No indexed project is active");
+        return this.#activeProject;
+    }
+
+    #handleGlobalInput(data: string): { consume?: boolean } | undefined {
+        if (
+            this.#activeJob &&
+            !this.#modalActive &&
+            !this.#cancelPromptActive &&
+            this.#ui.getFocusedComponent() === this.#editor &&
+            matchesKey(data, Key.escape)
+        ) {
+            this.#cancelPromptActive = true;
+            void this.#confirm(`Cancel indexing ${basename(this.#activeJob.root)}?`, false)
+                .then((cancel) => {
+                    if (cancel) this.#activeJob?.controller.abort(new Error("Indexing cancelled from the TUI"));
+                })
+                .finally(() => {
+                    this.#cancelPromptActive = false;
+                });
+            return { consume: true };
+        }
+        if (!matchesKey(data, Key.ctrl("c"))) return undefined;
+        if (this.#modalActive) return undefined;
+        if (this.#editor.getText()) {
+            this.#editor.setText("");
+            this.#ui.requestRender();
+            return { consume: true };
+        }
+        const now = Date.now();
+        if (now - this.#lastInterrupt < 1_000) {
+            void this.#quit();
+        } else {
+            this.#lastInterrupt = now;
+            this.#footer.setText(colors.warning("Press Ctrl+C again to quit"));
+            setTimeout(() => {
+                this.#footer.setText(colors.muted("/ commands · plain text searches · ↑↓ history · Ctrl+C twice exits"));
+                this.#ui.requestRender();
+            }, 1_000);
+            this.#ui.requestRender();
+        }
+        return { consume: true };
+    }
+
+    async #quit(): Promise<void> {
+        if (this.#stopping) return;
+        if (this.#activeJob) {
+            const cancel = await this.#confirm("Cancel indexing and quit?", false);
+            if (!cancel) return;
+            this.#activeJob.controller.abort(new Error("Indexing cancelled while exiting the TUI"));
+        }
+        this.#stopping = true;
+        this.#stopProgress();
+        this.#ui.terminal.setProgress(false);
+        this.#ui.stop();
+        await this.#ui.terminal.drainInput(200, 30);
+        this.#resolveRun?.();
+    }
+}
+
+function apiKeyOptions(): { apiKey?: string } {
+    return process.env.LM_STUDIO_API_KEY === undefined
+        ? {}
+        : { apiKey: process.env.LM_STUDIO_API_KEY };
+}
+
+function detectProjectRoot(cwd: string): string {
+    const result = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+        cwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+    });
+    return result.status === 0 && result.stdout.trim() ? resolve(result.stdout.trim()) : cwd;
+}
+
+function formatDuration(milliseconds: number): string {
+    const totalSeconds = Math.max(0, Math.round(milliseconds / 1_000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function relativeTime(value?: string): string {
+    if (!value) return "unknown time";
+    const milliseconds = Date.now() - new Date(value).getTime();
+    const minutes = Math.floor(milliseconds / 60_000);
+    if (minutes < 1) return "now";
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function splitPatterns(value: string): readonly string[] {
+    return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function projectSearchText(project: IndexedProjectSummary): string {
+    return `${project.projectIdentifier} ${project.root ?? ""} ${basename(project.root ?? "")}`;
+}
+
+function mediaTypeFor(path: string): string {
+    const extension = extname(path).toLowerCase();
+    return ({
+        ".css": "text/css",
+        ".csv": "text/csv",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".json": "application/json",
+        ".md": "text/markdown",
+        ".markdown": "text/markdown",
+        ".pdf": "application/pdf",
+        ".tsv": "text/tab-separated-values",
+        ".txt": "text/plain",
+        ".xml": "application/xml",
+        ".yaml": "application/yaml",
+        ".yml": "application/yaml",
+    } as Readonly<Record<string, string>>)[extension] ?? "application/octet-stream";
+}
