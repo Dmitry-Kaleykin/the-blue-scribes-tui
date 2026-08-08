@@ -52,6 +52,10 @@ import type { ProjectPreference } from "./domain/project-preferences.js";
 import { ProjectPreferenceStore } from "./services/preference-store.js";
 import { formatError } from "./services/error-formatter.js";
 import { shouldRenderIndexingProgressImmediately } from "./services/indexing-render-policy.js";
+import {
+    SystemProfileCredentialStore,
+    type ProfileCredentialStore,
+} from "./services/profile-credential-store.js";
 import { projectForDirectory } from "./services/project-context.js";
 import { colors, editorTheme } from "./theme.js";
 
@@ -76,13 +80,16 @@ interface ProposedIndexConfiguration {
 export interface ScribesTuiAppOptions {
     cwd?: string;
     preferences?: ProjectPreferenceStore;
+    credentials?: ProfileCredentialStore;
 }
 
 export class ScribesTuiApp {
     readonly #cwd: string;
     readonly #preferences: ProjectPreferenceStore;
+    readonly #credentials: ProfileCredentialStore;
     readonly #environmentApiKey = environmentApiKey();
-    readonly #profileApiKeys = new Map<string, string>();
+    readonly #sessionApiKeys = new Map<string, string>();
+    readonly #storedApiKeyCache = new Map<string, string | null>();
     readonly #profiles = new ProviderProfileService(apiKeyOptions(this.#environmentApiKey));
     readonly #profileRenames = new ProviderProfileRenameService();
     readonly #presets = new IndexingPresetService();
@@ -110,11 +117,13 @@ export class ScribesTuiApp {
     #stopping = false;
     #modalActive = false;
     #cancelPromptActive = false;
+    #credentialAvailability: Promise<boolean> | undefined;
     #resolveRun?: () => void;
 
     constructor(options: ScribesTuiAppOptions = {}) {
         this.#cwd = resolve(options.cwd ?? process.cwd());
         this.#preferences = options.preferences ?? new ProjectPreferenceStore();
+        this.#credentials = options.credentials ?? new SystemProfileCredentialStore();
         this.#footer.setLocation(this.#cwd);
         this.#editor.setAutocompleteProvider(
             new CombinedAutocompleteProvider(this.#autocompleteCommands(), this.#cwd),
@@ -181,7 +190,7 @@ export class ScribesTuiApp {
             case "jobs": this.#showJobs(); break;
             case "mcp": await this.#showMcp(); break;
             case "doctor": await this.#doctor(); break;
-            case "settings": this.#showSettings(); break;
+            case "settings": await this.#showSettings(); break;
             case "help": this.#append(commandHelp()); break;
             case "clear": this.#transcript.clear(); this.#ui.requestRender(true); break;
             case "quit": await this.#quit(); break;
@@ -202,7 +211,8 @@ export class ScribesTuiApp {
         this.#promptLabel.setState(this.#activeProject.root, true);
         this.#ui.requestRender();
         try {
-            const response = await this.#searchService(profile).search({
+            const searchService = await this.#searchService(profile);
+            const response = await searchService.search({
                 query,
                 projectReference: this.#activeProject.projectIdentifier,
                 profile,
@@ -313,12 +323,13 @@ export class ScribesTuiApp {
         this.#ui.requestRender();
 
         try {
-            const outcome = await this.#indexingService(configuration.profile).index({
+            const indexingService = await this.#indexingService(configuration.profile);
+            const outcome = await indexingService.index({
                 root: configuration.root,
                 provider: { type: "profile", profile: configuration.profile },
                 target: configuration.target,
                 keepReplacedBuilds: configuration.keepReplacedBuilds ?? 1,
-                ...(configuration.allowDirty === true ? { allowDirty: true } : {}),
+                ...(configuration.allowDirty ? { allowDirty: true } : {}),
                 ...(configuration.presetValue.maximumChunkSize === undefined
                     ? {}
                     : { maximumChunkSize: configuration.presetValue.maximumChunkSize }),
@@ -516,13 +527,14 @@ export class ScribesTuiApp {
     async #manageProfiles(argument = ""): Promise<void> {
         const profiles = await this.#profiles.list();
         const direct = argument ? profiles.find(({ name }) => name === argument) : undefined;
+        const profileItems = await Promise.all(profiles.map(async (profile) => ({
+            value: profile.name,
+            label: profile.name,
+            description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions · ${this.#rerankingSummary(profile)} · API key ${await this.#apiKeySource(profile.name)}`,
+        })));
         const selection = direct ? { value: direct.name, label: direct.name } : await this.#pick("Provider profiles", [
             { value: "__create", label: "+ Create profile", description: "Discover an OpenAI-compatible model" },
-            ...profiles.map((profile) => ({
-                value: profile.name,
-                label: profile.name,
-                description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions · ${this.#rerankingSummary(profile)} · API key ${this.#apiKeySource(profile.name)}`,
-            })),
+            ...profileItems,
         ]);
         if (!selection) return;
         if (selection.value === "__create") {
@@ -530,20 +542,37 @@ export class ScribesTuiApp {
             return;
         }
         const profile = profiles.find(({ name }) => name === selection.value)!;
-        const hasSessionApiKey = this.#profileApiKeys.has(profile.name);
+        const hasSessionApiKey = this.#sessionApiKeys.has(profile.name);
+        const credentialsAvailable = await this.#credentialsAvailable();
+        const storedApiKey = credentialsAvailable
+            ? await this.#storedApiKey(profile.name)
+            : undefined;
         const action = await this.#pick(profile.name, [
             { value: "use", label: "Use for current project" },
+            ...(credentialsAvailable
+                ? [{
+                    value: "save-api-key",
+                    label: storedApiKey === undefined
+                        ? `Save API key in ${this.#credentials.displayName}`
+                        : `Replace API key in ${this.#credentials.displayName}`,
+                    description: "Persists securely across TUI launches",
+                }]
+                : []),
             {
-                value: "api-key",
-                label: hasSessionApiKey ? "Replace API key" : "Set API key",
+                value: "session-api-key",
+                label: hasSessionApiKey ? "Replace session API key" : "Use API key for this session",
                 description: hasSessionApiKey
                     ? "Currently stored for this TUI session"
-                    : this.#environmentApiKey === undefined
-                        ? "Stored for this TUI session"
-                        : "Overrides the environment key for this profile",
+                    : "Kept only in memory and forgotten on exit",
             },
             ...(hasSessionApiKey
-                ? [{ value: "clear-api-key", label: "Clear session API key", description: "Return to the environment fallback" }]
+                ? [{ value: "clear-session-api-key", label: "Clear session API key", description: "Return to the saved or environment fallback" }]
+                : []),
+            ...(storedApiKey === undefined
+                ? []
+                : [{ value: "forget-api-key", label: `Forget API key in ${this.#credentials.displayName}` }]),
+            ...(!credentialsAvailable
+                ? [{ value: "keyring-unavailable", label: `${this.#credentials.displayName} unavailable`, description: "Session and environment keys still work" }]
                 : []),
             { value: "test", label: "Test connection" },
             { value: "edit", label: "Edit profile" },
@@ -560,26 +589,41 @@ export class ScribesTuiApp {
             this.#activePreference = await this.#preferences.set({ ...this.#activePreference, profile: profile.name });
             this.#append(`Project profile changed to ${profile.name}.`, "success");
             this.#updateHeader();
-        } else if (action.value === "api-key") {
+        } else if (action.value === "save-api-key") {
             const apiKey = await this.#secretInput(`API key for ${profile.name}`, "API key");
             if (apiKey === undefined) return;
             if (apiKey.length === 0) {
                 this.#append("The API key was empty; nothing changed.", "warning");
                 return;
             }
-            this.#profileApiKeys.set(profile.name, apiKey);
+            await this.#credentials.set(profile.name, apiKey);
+            this.#storedApiKeyCache.set(profile.name, apiKey);
+            this.#sessionApiKeys.delete(profile.name);
+            this.#append(`Saved the API key for ${profile.name} in ${this.#credentials.displayName}.`, "success");
+            await this.#diagnoseProfile(profile.name);
+        } else if (action.value === "session-api-key") {
+            const apiKey = await this.#secretInput(`API key for ${profile.name}`, "API key");
+            if (apiKey === undefined) return;
+            if (apiKey.length === 0) {
+                this.#append("The API key was empty; nothing changed.", "warning");
+                return;
+            }
+            this.#sessionApiKeys.set(profile.name, apiKey);
             this.#append(`API key set for ${profile.name}. It will be forgotten when this TUI exits.`, "success");
-        } else if (action.value === "clear-api-key") {
-            this.#profileApiKeys.delete(profile.name);
-            this.#append(
-                this.#environmentApiKey === undefined
-                    ? `Cleared the API key for ${profile.name}. No fallback key is configured.`
-                    : `Cleared the session API key for ${profile.name}; the environment key is active again.`,
-                "success",
-            );
+        } else if (action.value === "clear-session-api-key") {
+            this.#sessionApiKeys.delete(profile.name);
+            this.#append(`Cleared the session API key for ${profile.name}; API key ${await this.#apiKeySource(profile.name)} is active.`, "success");
+        } else if (action.value === "forget-api-key") {
+            if (!await this.#confirm(`Forget the saved API key for ${profile.name}?`)) return;
+            if (!await this.#credentials.delete(profile.name)) {
+                throw new Error(`Could not remove the saved API key for profile ${profile.name}`);
+            }
+            this.#storedApiKeyCache.set(profile.name, null);
+            this.#append(`Forgot the saved API key for ${profile.name}; API key ${await this.#apiKeySource(profile.name)} is active.`, "success");
+        } else if (action.value === "keyring-unavailable") {
+            this.#append(`${this.#credentials.displayName} is unavailable. Use a session key or OPENAI_COMPATIBLE_API_KEY.`, "warning");
         } else if (action.value === "test") {
-            this.#append("Testing provider…", "muted");
-            this.#append(JSON.stringify(await this.#profileService(profile.name).diagnose(profile.name), null, 2), "success");
+            await this.#diagnoseProfile(profile.name);
         } else if (action.value === "edit") {
             await this.#editProfile(profile);
         } else if (action.value === "rename") {
@@ -593,8 +637,27 @@ export class ScribesTuiApp {
                 return;
             }
             if (await this.#confirm(`Delete profile ${profile.name}?`)) {
-                await this.#profiles.remove(profile.name);
-                this.#profileApiKeys.delete(profile.name);
+                const savedApiKey = await this.#storedApiKey(profile.name);
+                if (savedApiKey !== undefined && !await this.#credentials.delete(profile.name)) {
+                    throw new Error(`Could not remove the saved API key for profile ${profile.name}`);
+                }
+                try {
+                    await this.#profiles.remove(profile.name);
+                } catch (error: unknown) {
+                    if (savedApiKey !== undefined) {
+                        try {
+                            await this.#credentials.set(profile.name, savedApiKey);
+                        } catch (rollbackError: unknown) {
+                            throw new AggregateError(
+                                [error, rollbackError],
+                                "The profile could not be deleted and its saved API key could not be restored",
+                            );
+                        }
+                    }
+                    throw error;
+                }
+                this.#storedApiKeyCache.delete(profile.name);
+                this.#sessionApiKeys.delete(profile.name);
                 this.#append(`Deleted profile ${profile.name}.`, "success");
             }
         }
@@ -611,6 +674,27 @@ export class ScribesTuiApp {
         if (!baseUrl) return;
         const apiKey = await this.#secretInput("Create provider profile", "API key (optional)");
         if (apiKey === undefined) return;
+        let apiKeyStorage: "saved" | "session" | undefined;
+        if (apiKey) {
+            if (await this.#credentialsAvailable()) {
+                const storage = await this.#pick("API key storage", [
+                    {
+                        value: "saved",
+                        label: `Save in ${this.#credentials.displayName}`,
+                        description: "Recommended · available automatically on future launches",
+                    },
+                    {
+                        value: "session",
+                        label: "Use for this session",
+                        description: "Kept only in memory and forgotten on exit",
+                    },
+                ]);
+                if (!storage) return;
+                apiKeyStorage = storage.value === "saved" ? "saved" : "session";
+            } else {
+                apiKeyStorage = "session";
+            }
+        }
         const profileService = new ProviderProfileService(apiKeyOptions(apiKey || this.#environmentApiKey));
         this.#append("Discovering provider models…", "muted");
         const models = await profileService.listProviderModels(baseUrl);
@@ -649,8 +733,25 @@ export class ScribesTuiApp {
                 }
                 : {}),
         });
-        if (apiKey) this.#profileApiKeys.set(saved.name, apiKey);
+        if (apiKey && apiKeyStorage === "saved") {
+            try {
+                await this.#credentials.set(saved.name, apiKey);
+                this.#storedApiKeyCache.set(saved.name, apiKey);
+            } catch (error: unknown) {
+                apiKeyStorage = "session";
+                this.#sessionApiKeys.set(saved.name, apiKey);
+                this.#append(
+                    `Could not save the API key in ${this.#credentials.displayName}; using it for this session instead. ${formatError(error)}`,
+                    "warning",
+                );
+            }
+        } else if (apiKey) {
+            this.#sessionApiKeys.set(saved.name, apiKey);
+        }
         this.#append(`Created profile ${saved.name} with ${inspection.dimensions} dimensions.`, "success");
+        if (apiKey && apiKeyStorage === "session" && !await this.#credentialsAvailable()) {
+            this.#append(`${this.#credentials.displayName} is unavailable; the API key will be forgotten when this TUI exits.`, "warning");
+        }
     }
 
     async #editProfile(profile: ProviderProfile): Promise<void> {
@@ -726,19 +827,36 @@ export class ScribesTuiApp {
             profile.name,
         ))?.trim();
         if (!nextName || nextName === profile.name) return;
+        const savedApiKey = await this.#storedApiKey(profile.name);
         const result = await this.#profileRenames.rename(profile.name, nextName);
         let updatedPreferences = 0;
+        let preferencesUpdated = false;
         try {
             updatedPreferences = await this.#preferences.replaceProfileReferences(
                 profile.name,
                 result.profile.name,
             );
+            preferencesUpdated = true;
+            if (savedApiKey !== undefined && !await this.#credentials.rename(profile.name, result.profile.name)) {
+                throw new Error(`Could not move the saved API key for profile ${profile.name}`);
+            }
         } catch (error: unknown) {
+            const rollbackErrors: unknown[] = [error];
+            if (preferencesUpdated) {
+                try {
+                    await this.#preferences.replaceProfileReferences(result.profile.name, profile.name);
+                } catch (rollbackError: unknown) {
+                    rollbackErrors.push(rollbackError);
+                }
+            }
             try {
                 await this.#profileRenames.rename(result.profile.name, profile.name);
             } catch (rollbackError: unknown) {
+                rollbackErrors.push(rollbackError);
+            }
+            if (rollbackErrors.length > 1) {
                 throw new AggregateError(
-                    [error, rollbackError],
+                    rollbackErrors,
                     "Profile was renamed but its references could not be fully updated or restored",
                 );
             }
@@ -747,10 +865,14 @@ export class ScribesTuiApp {
         this.#activePreference = this.#activeProject
             ? await this.#preferences.get(this.#activeProject.projectIdentifier)
             : undefined;
-        const apiKey = this.#profileApiKeys.get(profile.name);
+        if (savedApiKey !== undefined) {
+            this.#storedApiKeyCache.delete(profile.name);
+            this.#storedApiKeyCache.set(result.profile.name, savedApiKey);
+        }
+        const apiKey = this.#sessionApiKeys.get(profile.name);
         if (apiKey !== undefined) {
-            this.#profileApiKeys.delete(profile.name);
-            this.#profileApiKeys.set(result.profile.name, apiKey);
+            this.#sessionApiKeys.delete(profile.name);
+            this.#sessionApiKeys.set(result.profile.name, apiKey);
         }
         this.#append(
             `Renamed profile ${profile.name} to ${result.profile.name}; updated ${result.updatedPresets} preset(s), ${result.updatedProjectRecipes} project recipe(s), and ${updatedPreferences} TUI project preference(s).`,
@@ -1033,7 +1155,7 @@ export class ScribesTuiApp {
             this.#append("Create a provider profile before using collections.", "warning");
             return undefined;
         }
-        const profileService = this.#profileService(profileName);
+        const profileService = await this.#profileService(profileName);
         const profile = await profileService.get(profileName);
         const rerankingProvider = profileService.createRerankingProvider(profile);
         return {
@@ -1284,11 +1406,13 @@ export class ScribesTuiApp {
         const profiles = await this.#profiles.list();
         const selected = this.#activePreference?.profile ?? await this.#pickProfile(profiles, "Select profile to test");
         if (!selected) return;
-        this.#append(`Testing ${selected}…`, "muted");
-        this.#append(JSON.stringify(await this.#profileService(selected).diagnose(selected), null, 2), "success");
+        await this.#diagnoseProfile(selected);
     }
 
-    #showSettings(): void {
+    async #showSettings(): Promise<void> {
+        const credentialStatus = await this.#credentialsAvailable()
+            ? `${this.#credentials.displayName} is available for secure, persistent per-profile keys.`
+            : `${this.#credentials.displayName} is unavailable; session and environment keys still work.`;
         this.#append([
             "Terminal interaction",
             "",
@@ -1299,8 +1423,9 @@ export class ScribesTuiApp {
             "  Escape        close a selector; confirms before cancelling indexing",
             "  Ctrl+C twice  quit",
             "",
-            "API keys entered through /profile are masked and kept only for this TUI session.",
-            "OPENAI_COMPATIBLE_API_KEY is the fallback for profiles without a session key.",
+            `API keys can be saved per profile in ${this.#credentials.displayName} or kept only for this session.`,
+            credentialStatus,
+            "Resolution order: session key, saved key, OPENAI_COMPATIBLE_API_KEY.",
             "",
             "Project preferences are stored outside repositories under ~/.blue-scribes/tui.",
         ].join("\n"));
@@ -1426,25 +1551,52 @@ export class ScribesTuiApp {
         });
     }
 
-    #apiKey(profileName: string): string | undefined {
-        return this.#profileApiKeys.get(profileName) ?? this.#environmentApiKey;
+    async #credentialsAvailable(): Promise<boolean> {
+        this.#credentialAvailability ??= this.#credentials.isAvailable();
+        return this.#credentialAvailability;
     }
 
-    #apiKeySource(profileName: string): "session" | "environment" | "not set" {
-        if (this.#profileApiKeys.has(profileName)) return "session";
-        return this.#environmentApiKey === undefined ? "not set" : "environment";
+    async #storedApiKey(profileName: string): Promise<string | undefined> {
+        if (this.#storedApiKeyCache.has(profileName)) {
+            return this.#storedApiKeyCache.get(profileName) ?? undefined;
+        }
+        if (!await this.#credentialsAvailable()) {
+            this.#storedApiKeyCache.set(profileName, null);
+            return undefined;
+        }
+        const apiKey = await this.#credentials.get(profileName);
+        this.#storedApiKeyCache.set(profileName, apiKey ?? null);
+        return apiKey;
     }
 
-    #profileService(profileName: string): ProviderProfileService {
-        return new ProviderProfileService(apiKeyOptions(this.#apiKey(profileName)));
+    async #apiKey(profileName: string): Promise<string | undefined> {
+        return this.#sessionApiKeys.get(profileName)
+            ?? await this.#storedApiKey(profileName)
+            ?? this.#environmentApiKey;
     }
 
-    #indexingService(profileName: string): ProjectIndexingService {
-        return new ProjectIndexingService(apiKeyOptions(this.#apiKey(profileName)));
+    async #apiKeySource(profileName: string): Promise<string> {
+        if (this.#sessionApiKeys.has(profileName)) return "from this session";
+        if (await this.#storedApiKey(profileName) !== undefined) return `from ${this.#credentials.displayName}`;
+        return this.#environmentApiKey === undefined ? "not set" : "from the environment";
     }
 
-    #searchService(profileName: string): ProjectSearchService {
-        return new ProjectSearchService(apiKeyOptions(this.#apiKey(profileName)));
+    async #profileService(profileName: string): Promise<ProviderProfileService> {
+        return new ProviderProfileService(apiKeyOptions(await this.#apiKey(profileName)));
+    }
+
+    async #indexingService(profileName: string): Promise<ProjectIndexingService> {
+        return new ProjectIndexingService(apiKeyOptions(await this.#apiKey(profileName)));
+    }
+
+    async #searchService(profileName: string): Promise<ProjectSearchService> {
+        return new ProjectSearchService(apiKeyOptions(await this.#apiKey(profileName)));
+    }
+
+    async #diagnoseProfile(profileName: string): Promise<void> {
+        this.#append(`Testing ${profileName}…`, "muted");
+        const profileService = await this.#profileService(profileName);
+        this.#append(JSON.stringify(await profileService.diagnose(profileName), null, 2), "success");
     }
 
     async #confirm(title: string, defaultYes = true): Promise<boolean> {

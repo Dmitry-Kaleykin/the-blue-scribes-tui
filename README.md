@@ -64,7 +64,7 @@ in `$VISUAL` or `$EDITOR`, and `Escape` returns focus to the editor.
 | `/index` | Indexes the current project. Before starting, its confirmation screen can change the profile, preset, and publication target; later runs reuse the project selection. There is no separate reindex operation. |
 | `/project` | Fuzzy-selects a known project. `/project info` shows its state; `/project forget` removes only its managed index. |
 | `/search` | Opens a guided query prompt. Plain text performs the same search directly. |
-| `/profile` | Creates, selects, tests, edits, renames, inspects, or removes OpenAI-compatible provider profiles. It selects either dedicated `/v1/rerank` or legacy `/v1/completions` reranking and can set a masked, session-only API key. |
+| `/profile` | Creates, selects, tests, edits, renames, inspects, or removes OpenAI-compatible provider profiles. It selects either dedicated `/v1/rerank` or legacy `/v1/completions` reranking and manages masked per-profile API keys. |
 | `/preset` | Creates, selects, edits, renames, inspects, or removes indexing presets. |
 | `/builds` | Browses immutable build history and exact build metadata. |
 | `/target` | Switches, renames, or removes named retrieval targets. |
@@ -106,12 +106,21 @@ Each preference selects one provider profile and one indexing preset. Each
 immutable Scribes build continues to record its resolved configuration.
 
 Set `BLUE_SCRIBES_TUI_HOME` to override the TUI state directory, which is useful
-for tests or isolated environments. In `/profile`, **Set API key** accepts a
-masked key for one profile. The key stays only in process memory and is forgotten
-when the TUI exits; it is never written to a profile or project file. For reuse
-across launches, `OPENAI_COMPATIBLE_API_KEY` is passed through as the fallback
-for profiles without a session key. `LM_STUDIO_API_KEY` remains supported as a
-deprecated fallback for existing setups.
+for tests or isolated environments. In `/profile`, API keys can be handled in
+two ways:
+
+- **Save in macOS Keychain** stores the key securely for that profile and makes
+  it available automatically on future TUI launches. On other operating systems,
+  the equivalent native credential store is used.
+- **Use for this session** keeps the key only in process memory and forgets it
+  when the TUI exits.
+
+The TUI resolves a key in this order: session key, saved per-profile key, then
+`OPENAI_COMPATIBLE_API_KEY`. Keys are never written to a profile, project file,
+project preference, or terminal transcript. Saving a key immediately tests the
+profile. Renaming a profile moves its saved key; deleting a profile removes it.
+If the native credential store is unavailable, the session and environment
+options continue to work.
 
 When a profile has a reranker, its editor asks for the reranking interface:
 
