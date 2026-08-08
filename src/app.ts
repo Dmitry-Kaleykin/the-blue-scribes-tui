@@ -492,7 +492,7 @@ export class ScribesTuiApp {
         const profiles = await this.#profiles.list();
         const direct = argument ? profiles.find(({ name }) => name === argument) : undefined;
         const selection = direct ? { value: direct.name, label: direct.name } : await this.#pick("Provider profiles", [
-            { value: "__create", label: "+ Create profile", description: "Discover an LM Studio model" },
+            { value: "__create", label: "+ Create profile", description: "Discover an OpenAI-compatible model" },
             ...profiles.map((profile) => ({
                 value: profile.name,
                 label: profile.name,
@@ -544,22 +544,29 @@ export class ScribesTuiApp {
     async #createProfile(): Promise<void> {
         const name = (await this.#input("Create provider profile", "Name"))?.trim();
         if (!name) return;
-        this.#append("Discovering LM Studio models…", "muted");
-        const models = await this.#profiles.listLmStudioModels();
-        if (models.length === 0) throw new Error("LM Studio did not return any models");
+        const baseUrl = (await this.#input(
+            "Create provider profile",
+            "OpenAI-compatible base URL",
+            "http://127.0.0.1:1234/v1",
+        ))?.trim();
+        if (!baseUrl) return;
+        this.#append("Discovering provider models…", "muted");
+        const models = await this.#profiles.listProviderModels(baseUrl);
+        if (models.length === 0) throw new Error("The provider did not return any models");
         const selected = await this.#pick("Select embedding model", models.map((model) => ({
             value: model.id,
             label: model.id,
             ...(model.ownedBy === undefined ? {} : { description: model.ownedBy }),
         })));
         if (!selected) return;
-        const inspection = await this.#profiles.inspectLmStudioEmbeddingModel(selected.value);
+        const inspection = await this.#profiles.inspectEmbeddingModel(selected.value, baseUrl);
         const saved = await this.#profiles.set({
             name,
             embedding: {
-                provider: "lm-studio",
+                provider: "openai-compatible",
                 model: selected.value,
                 dimensions: inspection.dimensions,
+                baseUrl,
             },
         });
         this.#append(`Created profile ${saved.name} with ${inspection.dimensions} dimensions.`, "success");
@@ -568,7 +575,7 @@ export class ScribesTuiApp {
     async #editProfile(profile: ProviderProfile): Promise<void> {
         const baseUrl = (await this.#input(
             `Edit ${profile.name}`,
-            "LM Studio URL",
+            "OpenAI-compatible base URL",
             profile.embedding.baseUrl ?? "http://127.0.0.1:1234/v1",
         ))?.trim();
         if (baseUrl === undefined) return;
@@ -597,7 +604,7 @@ export class ScribesTuiApp {
         await this.#profiles.set({
             name: profile.name,
             embedding: {
-                provider: "lm-studio",
+                provider: "openai-compatible",
                 model,
                 dimensions,
                 ...(baseUrl ? { baseUrl } : {}),
@@ -611,7 +618,7 @@ export class ScribesTuiApp {
             ...(rerankingModel
                 ? {
                     reranking: {
-                        provider: "lm-studio-qwen3" as const,
+                        provider: "openai-compatible-qwen3" as const,
                         model: rerankingModel,
                         ...(baseUrl ? { baseUrl } : {}),
                         ...(profile.reranking?.instruction === undefined
@@ -1327,9 +1334,11 @@ export class ScribesTuiApp {
 }
 
 function apiKeyOptions(): { apiKey?: string } {
-    return process.env.LM_STUDIO_API_KEY === undefined
+    const apiKey = process.env.OPENAI_COMPATIBLE_API_KEY ??
+        process.env.LM_STUDIO_API_KEY;
+    return apiKey === undefined
         ? {}
-        : { apiKey: process.env.LM_STUDIO_API_KEY };
+        : { apiKey };
 }
 
 function detectProjectRoot(cwd: string): string {
@@ -1365,6 +1374,10 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
 
 function splitPatterns(value: string): readonly string[] {
     return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function projectSearchText(project: IndexedProjectSummary): string {
+    return `${project.projectIdentifier} ${project.root ?? ""} ${basename(project.root ?? "")}`;
 }
 
 function mediaTypeFor(path: string): string {

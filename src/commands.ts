@@ -12,7 +12,7 @@ export const COMMANDS: readonly SlashCommand[] = [
     { name: "collection", description: "Browse and search managed document collections" },
     { name: "jobs", description: "Show the active indexing operation" },
     { name: "mcp", description: "Print MCP configuration for the active project" },
-    { name: "doctor", description: "Test the selected LM Studio provider" },
+    { name: "doctor", description: "Test the selected model provider" },
     { name: "settings", description: "Show terminal interaction settings" },
     { name: "help", description: "Show commands and keyboard shortcuts" },
     { name: "clear", description: "Clear the visible transcript" },
