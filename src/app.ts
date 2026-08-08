@@ -46,7 +46,7 @@ import { Picker } from "./components/picker.js";
 import { PromptLabelComponent } from "./components/prompt-label.js";
 import { SearchResultsComponent } from "./components/search-results.js";
 import { TextPrompt } from "./components/text-prompt.js";
-import type { ProjectPreference, ProjectPreferenceInput } from "./domain/project-preferences.js";
+import type { ProjectPreference } from "./domain/project-preferences.js";
 import { ProjectPreferenceStore } from "./services/preference-store.js";
 import { projectForDirectory } from "./services/project-context.js";
 import { colors, editorTheme } from "./theme.js";
@@ -298,7 +298,7 @@ export class ScribesTuiApp {
                 provider: { type: "profile", profile: configuration.profile },
                 target: configuration.target,
                 keepReplacedBuilds: configuration.keepReplacedBuilds ?? 1,
-                ...(configuration.allowDirty === true ? { allowDirty: true } : {}),
+                ...(configuration.allowDirty ? { allowDirty: true } : {}),
                 ...(configuration.presetValue.maximumChunkSize === undefined
                     ? {}
                     : { maximumChunkSize: configuration.presetValue.maximumChunkSize }),
@@ -1365,10 +1365,6 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
 
 function splitPatterns(value: string): readonly string[] {
     return value.split(",").map((item) => item.trim()).filter(Boolean);
-}
-
-function projectSearchText(project: IndexedProjectSummary): string {
-    return `${project.projectIdentifier} ${project.root ?? ""} ${basename(project.root ?? "")}`;
 }
 
 function mediaTypeFor(path: string): string {
