@@ -61,7 +61,7 @@ in `$VISUAL` or `$EDITOR`, and `Escape` returns focus to the editor.
 
 | Command | Behavior |
 | --- | --- |
-| `/index` | Indexes the current project. The first run selects a profile and preset; later runs reuse the project selection. There is no separate reindex operation. |
+| `/index` | Indexes the current project. Before starting, its confirmation screen can change the profile, preset, and publication target; later runs reuse the project selection. There is no separate reindex operation. |
 | `/project` | Fuzzy-selects a known project. `/project info` shows its state; `/project forget` removes only its managed index. |
 | `/search` | Opens a guided query prompt. Plain text performs the same search directly. |
 | `/profile` | Creates, selects, tests, edits, renames, inspects, or removes OpenAI-compatible provider profiles. |

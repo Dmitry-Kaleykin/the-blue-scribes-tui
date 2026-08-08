@@ -22,6 +22,7 @@ import {
     IndexingPresetService,
     listIndexedProjects,
     managedProjectIdentifier,
+    normalizeRetrievalTargetName,
     ProjectIndexingService,
     ProjectInspectionService,
     ProjectRetrievalTargetService,
@@ -253,17 +254,31 @@ export class ScribesTuiApp {
         if (!presetName) presetName = await this.#pickPreset(presets, "Select indexing preset") ?? undefined;
         if (!presetName) return;
 
-        const action = await this.#pick("Index project", [
-            { value: "start", label: "Start indexing", description: `${profileName} · ${presetName}` },
-            { value: "profile", label: "Change profile", description: profileName },
-            { value: "preset", label: "Change preset", description: presetName },
-            { value: "cancel", label: "Cancel" },
-        ]);
-        if (!action || action.value === "cancel") return;
-        if (action.value === "profile") {
-            profileName = await this.#pickProfile(profiles, "Select provider profile") ?? profileName;
-        } else if (action.value === "preset") {
-            presetName = await this.#pickPreset(presets, "Select indexing preset") ?? presetName;
+        let target = this.#activePreference?.target ?? "main";
+        while (true) {
+            const action = await this.#pick("Index project", [
+                { value: "start", label: "Start indexing", description: `${profileName} · ${presetName} · target ${target}` },
+                { value: "profile", label: "Change profile", description: profileName },
+                { value: "preset", label: "Change preset", description: presetName },
+                { value: "target", label: "Change target", description: target },
+                { value: "cancel", label: "Cancel" },
+            ]);
+            if (!action || action.value === "cancel") return;
+            if (action.value === "start") break;
+            if (action.value === "profile") {
+                const selected = await this.#pickProfile(profiles, "Select provider profile");
+                if (selected) profileName = selected;
+            } else if (action.value === "preset") {
+                const selected = await this.#pickPreset(presets, "Select indexing preset");
+                if (selected) presetName = selected;
+            } else if (action.value === "target") {
+                const selected = (await this.#input(
+                    "Index project",
+                    "Target",
+                    target,
+                ))?.trim();
+                if (selected) target = normalizeRetrievalTargetName(selected);
+            }
         }
 
         const presetValue = presets.find(({ name }) => name === presetName)!;
@@ -272,7 +287,7 @@ export class ScribesTuiApp {
             root,
             profile: profileName,
             preset: presetName,
-            target: this.#activePreference?.target ?? "main",
+            target,
             keepReplacedBuilds: this.#activePreference?.keepReplacedBuilds ?? 1,
             allowDirty: this.#activePreference?.allowDirty ?? false,
             presetValue,
