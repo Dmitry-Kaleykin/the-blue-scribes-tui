@@ -13,6 +13,7 @@ export interface TextPromptOptions {
     title: string;
     label?: string;
     initialValue?: string;
+    maskInput?: boolean;
     onSubmit: (value: string) => void;
     onCancel: () => void;
     requestRender: () => void;
@@ -25,6 +26,7 @@ export class TextPrompt implements Component, Focusable {
     readonly #onSubmit: (value: string) => void;
     readonly #onCancel: () => void;
     readonly #requestRender: () => void;
+    readonly #maskInput: boolean;
     #focused = false;
 
     constructor(options: TextPromptOptions) {
@@ -33,6 +35,7 @@ export class TextPrompt implements Component, Focusable {
         this.#onSubmit = options.onSubmit;
         this.#onCancel = options.onCancel;
         this.#requestRender = options.requestRender;
+        this.#maskInput = options.maskInput ?? false;
         this.#input.setValue(options.initialValue ?? "");
     }
 
@@ -62,11 +65,14 @@ export class TextPrompt implements Component, Focusable {
         const line = colors.muted("─".repeat(Math.max(0, width)));
         const label = `  ${colors.accent(this.#label)} `;
         const inputWidth = Math.max(1, width - 6 - this.#label.length);
+        const renderedInput = this.#maskInput
+            ? this.#renderMaskedInput(inputWidth)
+            : this.#input.render(inputWidth)[0] ?? "";
         return [
             line,
             truncateToWidth(`  ${colors.bold(colors.accent(this.#title))}`, width),
             "",
-            truncateToWidth(`${label}${this.#input.render(inputWidth)[0] ?? ""}`, width),
+            truncateToWidth(`${label}${renderedInput}`, width),
             "",
             truncateToWidth(`  ${colors.muted("Enter confirm · Esc cancel")}`, width),
             line,
@@ -75,5 +81,17 @@ export class TextPrompt implements Component, Focusable {
 
     invalidate(): void {
         this.#input.invalidate();
+    }
+
+    #renderMaskedInput(width: number): string {
+        const value = this.#input.getValue();
+        // Input keeps its cursor when setValue receives a string of the same
+        // UTF-16 length, so navigation and horizontal scrolling still work.
+        this.#input.setValue("•".repeat(value.length));
+        try {
+            return this.#input.render(width)[0] ?? "";
+        } finally {
+            this.#input.setValue(value);
+        }
     }
 }

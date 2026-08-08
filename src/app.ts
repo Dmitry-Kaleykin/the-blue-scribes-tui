@@ -80,11 +80,12 @@ export interface ScribesTuiAppOptions {
 export class ScribesTuiApp {
     readonly #cwd: string;
     readonly #preferences: ProjectPreferenceStore;
-    readonly #profiles = new ProviderProfileService(apiKeyOptions());
+    readonly #environmentApiKey = environmentApiKey();
+    readonly #profileApiKeys = new Map<string, string>();
+    readonly #profiles = new ProviderProfileService(apiKeyOptions(this.#environmentApiKey));
     readonly #profileRenames = new ProviderProfileRenameService();
     readonly #presets = new IndexingPresetService();
-    readonly #indexing = new ProjectIndexingService(apiKeyOptions());
-    readonly #search = new ProjectSearchService(apiKeyOptions());
+    readonly #indexing = new ProjectIndexingService(apiKeyOptions(this.#environmentApiKey));
     readonly #inspection = new ProjectInspectionService();
     readonly #targets = new ProjectRetrievalTargetService();
     readonly #ui = new TuiMainScreen(new ProcessTerminal());
@@ -200,7 +201,7 @@ export class ScribesTuiApp {
         this.#promptLabel.setState(this.#activeProject.root, true);
         this.#ui.requestRender();
         try {
-            const response = await this.#search.search({
+            const response = await this.#searchService(profile).search({
                 query,
                 projectReference: this.#activeProject.projectIdentifier,
                 profile,
@@ -311,7 +312,7 @@ export class ScribesTuiApp {
         this.#ui.requestRender();
 
         try {
-            const outcome = await this.#indexing.index({
+            const outcome = await this.#indexingService(configuration.profile).index({
                 root: configuration.root,
                 provider: { type: "profile", profile: configuration.profile },
                 target: configuration.target,
@@ -514,7 +515,7 @@ export class ScribesTuiApp {
             ...profiles.map((profile) => ({
                 value: profile.name,
                 label: profile.name,
-                description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions`,
+                description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions · API key ${this.#apiKeySource(profile.name)}`,
             })),
         ]);
         if (!selection) return;
@@ -523,8 +524,21 @@ export class ScribesTuiApp {
             return;
         }
         const profile = profiles.find(({ name }) => name === selection.value)!;
+        const hasSessionApiKey = this.#profileApiKeys.has(profile.name);
         const action = await this.#pick(profile.name, [
             { value: "use", label: "Use for current project" },
+            {
+                value: "api-key",
+                label: hasSessionApiKey ? "Replace API key" : "Set API key",
+                description: hasSessionApiKey
+                    ? "Currently stored for this TUI session"
+                    : this.#environmentApiKey === undefined
+                        ? "Stored for this TUI session"
+                        : "Overrides the environment key for this profile",
+            },
+            ...(hasSessionApiKey
+                ? [{ value: "clear-api-key", label: "Clear session API key", description: "Return to the environment fallback" }]
+                : []),
             { value: "test", label: "Test connection" },
             { value: "edit", label: "Edit profile" },
             { value: "rename", label: "Rename" },
@@ -540,9 +554,26 @@ export class ScribesTuiApp {
             this.#activePreference = await this.#preferences.set({ ...this.#activePreference, profile: profile.name });
             this.#append(`Project profile changed to ${profile.name}.`, "success");
             this.#updateHeader();
+        } else if (action.value === "api-key") {
+            const apiKey = await this.#secretInput(`API key for ${profile.name}`, "API key");
+            if (apiKey === undefined) return;
+            if (apiKey.length === 0) {
+                this.#append("The API key was empty; nothing changed.", "warning");
+                return;
+            }
+            this.#profileApiKeys.set(profile.name, apiKey);
+            this.#append(`API key set for ${profile.name}. It will be forgotten when this TUI exits.`, "success");
+        } else if (action.value === "clear-api-key") {
+            this.#profileApiKeys.delete(profile.name);
+            this.#append(
+                this.#environmentApiKey === undefined
+                    ? `Cleared the API key for ${profile.name}. No fallback key is configured.`
+                    : `Cleared the session API key for ${profile.name}; the environment key is active again.`,
+                "success",
+            );
         } else if (action.value === "test") {
             this.#append("Testing provider…", "muted");
-            this.#append(JSON.stringify(await this.#profiles.diagnose(profile.name), null, 2), "success");
+            this.#append(JSON.stringify(await this.#profileService(profile.name).diagnose(profile.name), null, 2), "success");
         } else if (action.value === "edit") {
             await this.#editProfile(profile);
         } else if (action.value === "rename") {
@@ -557,6 +588,7 @@ export class ScribesTuiApp {
             }
             if (await this.#confirm(`Delete profile ${profile.name}?`)) {
                 await this.#profiles.remove(profile.name);
+                this.#profileApiKeys.delete(profile.name);
                 this.#append(`Deleted profile ${profile.name}.`, "success");
             }
         }
@@ -571,8 +603,11 @@ export class ScribesTuiApp {
             "http://127.0.0.1:1234/v1",
         ))?.trim();
         if (!baseUrl) return;
+        const apiKey = await this.#secretInput("Create provider profile", "API key (optional)");
+        if (apiKey === undefined) return;
+        const profileService = new ProviderProfileService(apiKeyOptions(apiKey || this.#environmentApiKey));
         this.#append("Discovering provider models…", "muted");
-        const models = await this.#profiles.listProviderModels(baseUrl);
+        const models = await profileService.listProviderModels(baseUrl);
         if (models.length === 0) throw new Error("The provider did not return any models");
         const selected = await this.#pick("Select embedding model", models.map((model) => ({
             value: model.id,
@@ -580,7 +615,7 @@ export class ScribesTuiApp {
             ...(model.ownedBy === undefined ? {} : { description: model.ownedBy }),
         })));
         if (!selected) return;
-        const inspection = await this.#profiles.inspectEmbeddingModel(selected.value, baseUrl);
+        const inspection = await profileService.inspectEmbeddingModel(selected.value, baseUrl);
         const saved = await this.#profiles.set({
             name,
             embedding: {
@@ -590,6 +625,7 @@ export class ScribesTuiApp {
                 baseUrl,
             },
         });
+        if (apiKey) this.#profileApiKeys.set(saved.name, apiKey);
         this.#append(`Created profile ${saved.name} with ${inspection.dimensions} dimensions.`, "success");
     }
 
@@ -680,6 +716,11 @@ export class ScribesTuiApp {
         this.#activePreference = this.#activeProject
             ? await this.#preferences.get(this.#activeProject.projectIdentifier)
             : undefined;
+        const apiKey = this.#profileApiKeys.get(profile.name);
+        if (apiKey !== undefined) {
+            this.#profileApiKeys.delete(profile.name);
+            this.#profileApiKeys.set(result.profile.name, apiKey);
+        }
         this.#append(
             `Renamed profile ${profile.name} to ${result.profile.name}; updated ${result.updatedPresets} preset(s), ${result.updatedProjectRecipes} project recipe(s), and ${updatedPreferences} TUI project preference(s).`,
             "success",
@@ -961,12 +1002,13 @@ export class ScribesTuiApp {
             this.#append("Create a provider profile before using collections.", "warning");
             return undefined;
         }
-        const profile = await this.#profiles.get(profileName);
-        const rerankingProvider = this.#profiles.createRerankingProvider(profile);
+        const profileService = this.#profileService(profileName);
+        const profile = await profileService.get(profileName);
+        const rerankingProvider = profileService.createRerankingProvider(profile);
         return {
             profileName,
             service: new CollectionService({
-                embeddingProvider: this.#profiles.createEmbeddingProvider(profile),
+                embeddingProvider: profileService.createEmbeddingProvider(profile),
                 ...(rerankingProvider === undefined ? {} : { rerankingProvider }),
             }),
         };
@@ -1212,7 +1254,7 @@ export class ScribesTuiApp {
         const selected = this.#activePreference?.profile ?? await this.#pickProfile(profiles, "Select profile to test");
         if (!selected) return;
         this.#append(`Testing ${selected}…`, "muted");
-        this.#append(JSON.stringify(await this.#profiles.diagnose(selected), null, 2), "success");
+        this.#append(JSON.stringify(await this.#profileService(selected).diagnose(selected), null, 2), "success");
     }
 
     #showSettings(): void {
@@ -1225,6 +1267,9 @@ export class ScribesTuiApp {
             "  Tab           complete command or path",
             "  Escape        close a selector; confirms before cancelling indexing",
             "  Ctrl+C twice  quit",
+            "",
+            "API keys entered through /profile are masked and kept only for this TUI session.",
+            "OPENAI_COMPATIBLE_API_KEY is the fallback for profiles without a session key.",
             "",
             "Project preferences are stored outside repositories under ~/.blue-scribes/tui.",
         ].join("\n"));
@@ -1308,6 +1353,19 @@ export class ScribesTuiApp {
     }
 
     async #input(title: string, label: string, initialValue?: string): Promise<string | undefined> {
+        return this.#promptInput(title, label, initialValue, false);
+    }
+
+    async #secretInput(title: string, label: string): Promise<string | undefined> {
+        return this.#promptInput(title, label, undefined, true);
+    }
+
+    async #promptInput(
+        title: string,
+        label: string,
+        initialValue: string | undefined,
+        maskInput: boolean,
+    ): Promise<string | undefined> {
         return new Promise((resolveInput) => {
             this.#modalActive = true;
             let settled = false;
@@ -1325,6 +1383,7 @@ export class ScribesTuiApp {
                 title,
                 label,
                 ...(initialValue === undefined ? {} : { initialValue }),
+                ...(maskInput ? { maskInput: true } : {}),
                 onSubmit: (value) => finish(value),
                 onCancel: () => finish(),
                 requestRender: () => this.#ui.requestRender(),
@@ -1334,6 +1393,27 @@ export class ScribesTuiApp {
             this.#ui.setFocus(prompt);
             this.#ui.requestRender(true);
         });
+    }
+
+    #apiKey(profileName: string): string | undefined {
+        return this.#profileApiKeys.get(profileName) ?? this.#environmentApiKey;
+    }
+
+    #apiKeySource(profileName: string): "session" | "environment" | "not set" {
+        if (this.#profileApiKeys.has(profileName)) return "session";
+        return this.#environmentApiKey === undefined ? "not set" : "environment";
+    }
+
+    #profileService(profileName: string): ProviderProfileService {
+        return new ProviderProfileService(apiKeyOptions(this.#apiKey(profileName)));
+    }
+
+    #indexingService(profileName: string): ProjectIndexingService {
+        return new ProjectIndexingService(apiKeyOptions(this.#apiKey(profileName)));
+    }
+
+    #searchService(profileName: string): ProjectSearchService {
+        return new ProjectSearchService(apiKeyOptions(this.#apiKey(profileName)));
     }
 
     async #confirm(title: string, defaultYes = true): Promise<boolean> {
@@ -1426,9 +1506,11 @@ export class ScribesTuiApp {
     }
 }
 
-function apiKeyOptions(): { apiKey?: string } {
-    const apiKey = process.env.OPENAI_COMPATIBLE_API_KEY ??
-        process.env.LM_STUDIO_API_KEY;
+function environmentApiKey(): string | undefined {
+    return process.env.OPENAI_COMPATIBLE_API_KEY ?? process.env.LM_STUDIO_API_KEY;
+}
+
+function apiKeyOptions(apiKey: string | undefined): { apiKey?: string } {
     return apiKey === undefined
         ? {}
         : { apiKey };
