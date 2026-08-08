@@ -64,7 +64,7 @@ in `$VISUAL` or `$EDITOR`, and `Escape` returns focus to the editor.
 | `/index` | Indexes the current project. Before starting, its confirmation screen can change the profile, preset, and publication target; later runs reuse the project selection. There is no separate reindex operation. |
 | `/project` | Fuzzy-selects a known project. `/project info` shows its state; `/project forget` removes only its managed index. |
 | `/search` | Opens a guided query prompt. Plain text performs the same search directly. |
-| `/profile` | Creates, selects, tests, edits, renames, inspects, or removes OpenAI-compatible provider profiles. It can also set a masked, session-only API key for an individual profile. |
+| `/profile` | Creates, selects, tests, edits, renames, inspects, or removes OpenAI-compatible provider profiles. It selects either dedicated `/v1/rerank` or legacy `/v1/completions` reranking and can set a masked, session-only API key. |
 | `/preset` | Creates, selects, edits, renames, inspects, or removes indexing presets. |
 | `/builds` | Browses immutable build history and exact build metadata. |
 | `/target` | Switches, renames, or removes named retrieval targets. |
@@ -112,6 +112,13 @@ when the TUI exits; it is never written to a profile or project file. For reuse
 across launches, `OPENAI_COMPATIBLE_API_KEY` is passed through as the fallback
 for profiles without a session key. `LM_STUDIO_API_KEY` remains supported as a
 deprecated fallback for existing setups.
+
+When a profile has a reranker, its editor asks for the reranking interface:
+
+- **Dedicated `/v1/rerank`** sends all bounded candidates in one request and is
+  recommended for oMLX.
+- **Legacy `/v1/completions`** retains Qwen3 `yes`/`no` next-token scoring for
+  compatible runtimes and remains selected for existing profiles.
 
 ## Development checks
 

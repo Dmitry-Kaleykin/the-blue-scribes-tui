@@ -515,7 +515,7 @@ export class ScribesTuiApp {
             ...profiles.map((profile) => ({
                 value: profile.name,
                 label: profile.name,
-                description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions · API key ${this.#apiKeySource(profile.name)}`,
+                description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions · ${this.#rerankingSummary(profile)} · API key ${this.#apiKeySource(profile.name)}`,
             })),
         ]);
         if (!selection) return;
@@ -616,6 +616,15 @@ export class ScribesTuiApp {
         })));
         if (!selected) return;
         const inspection = await profileService.inspectEmbeddingModel(selected.value, baseUrl);
+        const rerankingModel = (await this.#input(
+            "Create provider profile",
+            "Reranker model (empty disables)",
+        ))?.trim();
+        if (rerankingModel === undefined) return;
+        const rerankingProvider = rerankingModel
+            ? await this.#pickRerankingInterface()
+            : undefined;
+        if (rerankingModel && rerankingProvider === undefined) return;
         const saved = await this.#profiles.set({
             name,
             embedding: {
@@ -624,6 +633,15 @@ export class ScribesTuiApp {
                 dimensions: inspection.dimensions,
                 baseUrl,
             },
+            ...(rerankingModel && rerankingProvider
+                ? {
+                    reranking: {
+                        provider: rerankingProvider,
+                        model: rerankingModel,
+                        baseUrl,
+                    },
+                }
+                : {}),
         });
         if (apiKey) this.#profileApiKeys.set(saved.name, apiKey);
         this.#append(`Created profile ${saved.name} with ${inspection.dimensions} dimensions.`, "success");
@@ -658,6 +676,10 @@ export class ScribesTuiApp {
             profile.reranking?.model ?? "",
         ))?.trim();
         if (rerankingModel === undefined) return;
+        const rerankingProvider = rerankingModel
+            ? await this.#pickRerankingInterface(profile.reranking?.provider)
+            : undefined;
+        if (rerankingModel && rerankingProvider === undefined) return;
         await this.#profiles.set({
             name: profile.name,
             embedding: {
@@ -672,13 +694,16 @@ export class ScribesTuiApp {
                     ? {}
                     : { embeddingSuffix: profile.embedding.embeddingSuffix }),
             },
-            ...(rerankingModel
+            ...(rerankingModel && rerankingProvider
                 ? {
                     reranking: {
-                        provider: "openai-compatible-qwen3" as const,
+                        provider: rerankingProvider,
                         model: rerankingModel,
                         ...(baseUrl ? { baseUrl } : {}),
-                        ...(profile.reranking?.instruction === undefined
+                        ...(rerankingProvider !== "openai-compatible-qwen3" ||
+                                profile.reranking === undefined ||
+                                !("instruction" in profile.reranking) ||
+                                profile.reranking.instruction === undefined
                             ? {}
                             : { instruction: profile.reranking.instruction }),
                     },
@@ -1431,9 +1456,50 @@ export class ScribesTuiApp {
         const selection = await this.#pick(title, profiles.map((profile) => ({
             value: profile.name,
             label: profile.name,
-            description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions`,
+            description: `${profile.embedding.model} · ${profile.embedding.dimensions} dimensions · ${this.#rerankingSummary(profile)}`,
         })));
         return selection?.value;
+    }
+
+    async #pickRerankingInterface(
+        currentProvider?: NonNullable<ProviderProfile["reranking"]>["provider"],
+    ): Promise<"openai-compatible-rerank" | "openai-compatible-qwen3" | undefined> {
+        const current = currentProvider === "openai-compatible-rerank"
+            ? "openai-compatible-rerank"
+            : currentProvider === undefined
+                ? undefined
+                : "openai-compatible-qwen3";
+        const dedicated: SelectItem = {
+            value: "openai-compatible-rerank",
+            label: "Dedicated /v1/rerank",
+            description: current === "openai-compatible-rerank"
+                ? "Current · recommended for oMLX"
+                : "Recommended for oMLX",
+        };
+        const completions: SelectItem = {
+            value: "openai-compatible-qwen3",
+            label: "Legacy /v1/completions",
+            description: current === "openai-compatible-qwen3"
+                ? "Current · Qwen3 yes/no next-token scoring"
+                : "Qwen3 yes/no next-token scoring",
+        };
+        const selection = await this.#pick(
+            "Reranking interface",
+            current === "openai-compatible-qwen3"
+                ? [completions, dedicated]
+                : [dedicated, completions],
+        );
+        return selection?.value === "openai-compatible-rerank" ||
+            selection?.value === "openai-compatible-qwen3"
+            ? selection.value
+            : undefined;
+    }
+
+    #rerankingSummary(profile: ProviderProfile): string {
+        if (profile.reranking === undefined) return "reranking off";
+        return profile.reranking.provider === "openai-compatible-rerank"
+            ? "rerank /v1/rerank"
+            : "rerank /v1/completions";
     }
 
     async #pickPreset(presets: readonly IndexingPreset[], title: string): Promise<string | undefined> {
