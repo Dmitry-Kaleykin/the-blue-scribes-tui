@@ -39,6 +39,7 @@ import {
 } from "the-blue-scribes";
 
 import { commandHelp, COMMANDS } from "./commands.js";
+import { FooterComponent } from "./components/footer.js";
 import { HeaderComponent } from "./components/header.js";
 import { IndexingProgressComponent } from "./components/indexing-progress.js";
 import { Picker } from "./components/picker.js";
@@ -92,7 +93,7 @@ export class ScribesTuiApp {
         paddingX: 1,
         autocompleteMaxVisible: 10,
     });
-    readonly #footer = new Text(colors.muted("/ commands · plain text searches · ↑↓ history · Ctrl+C twice exits"), 0, 0);
+    readonly #footer = new FooterComponent();
     #projects: readonly IndexedProjectSummary[] = [];
     #activeProject: IndexedProjectSummary | undefined;
     #activePreference: ProjectPreference | undefined;
@@ -108,6 +109,7 @@ export class ScribesTuiApp {
     constructor(options: ScribesTuiAppOptions = {}) {
         this.#cwd = resolve(options.cwd ?? process.cwd());
         this.#preferences = options.preferences ?? new ProjectPreferenceStore();
+        this.#footer.setLocation(this.#cwd);
         this.#editor.setAutocompleteProvider(
             new CombinedAutocompleteProvider(this.#autocompleteCommands(), this.#cwd),
         );
@@ -1157,6 +1159,7 @@ export class ScribesTuiApp {
             indexing: this.#activeJob !== undefined,
         });
         this.#promptLabel.setState(this.#activeProject?.root, false);
+        this.#footer.setLocation(this.#cwd, this.#activeProject?.root);
         this.#ui.requestRender();
     }
 
@@ -1297,9 +1300,9 @@ export class ScribesTuiApp {
             void this.#quit();
         } else {
             this.#lastInterrupt = now;
-            this.#footer.setText(colors.warning("Press Ctrl+C again to quit"));
+            this.#footer.setNotice("Press Ctrl+C again to quit");
             setTimeout(() => {
-                this.#footer.setText(colors.muted("/ commands · plain text searches · ↑↓ history · Ctrl+C twice exits"));
+                this.#footer.setNotice();
                 this.#ui.requestRender();
             }, 1_000);
             this.#ui.requestRender();
