@@ -1376,10 +1376,6 @@ function splitPatterns(value: string): readonly string[] {
     return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
-function projectSearchText(project: IndexedProjectSummary): string {
-    return `${project.projectIdentifier} ${project.root ?? ""} ${basename(project.root ?? "")}`;
-}
-
 function mediaTypeFor(path: string): string {
     const extension = extname(path).toLowerCase();
     return ({
