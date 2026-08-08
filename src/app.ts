@@ -1386,7 +1386,7 @@ export class ScribesTuiApp {
                     project.root ?? project.projectIdentifier,
                     ...(profile ? ["--profile", profile] : []),
                     "--tools",
-                    "search_project",
+                    "vector_search",
                 ],
             },
         }, null, 2);
