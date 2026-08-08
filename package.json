@@ -12,7 +12,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc --project tsconfig.build.json",
+    "build": "tsc --project tsconfig.build.json && node scripts/mark-binaries-executable.mjs dist/cli.js",
     "dev": "node --import tsx src/cli.ts",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"
