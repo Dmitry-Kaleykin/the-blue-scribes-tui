@@ -64,8 +64,8 @@ in `$VISUAL` or `$EDITOR`, and `Escape` returns focus to the editor.
 | `/index` | Indexes the current project. The first run selects a profile and preset; later runs reuse the project selection. There is no separate reindex operation. |
 | `/project` | Fuzzy-selects a known project. `/project info` shows its state; `/project forget` removes only its managed index. |
 | `/search` | Opens a guided query prompt. Plain text performs the same search directly. |
-| `/profile` | Creates, selects, tests, edits, inspects, or removes OpenAI-compatible provider profiles. |
-| `/preset` | Creates, selects, edits, inspects, or removes indexing presets. |
+| `/profile` | Creates, selects, tests, edits, renames, inspects, or removes OpenAI-compatible provider profiles. |
+| `/preset` | Creates, selects, edits, renames, inspects, or removes indexing presets. |
 | `/builds` | Browses immutable build history and exact build metadata. |
 | `/target` | Switches, renames, or removes named retrieval targets. |
 | `/chunks <path>` | Shows the exact stored chunks for an indexed file. Paths autocomplete. |

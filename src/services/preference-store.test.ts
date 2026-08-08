@@ -31,3 +31,33 @@ test("stores one external preference per project", async () => {
     assert.equal(projects[0]?.target, "release");
     assert.equal((JSON.parse(await readFile(path, "utf8")) as { schemaVersion: number }).schemaVersion, 1);
 });
+
+test("replaces profile and preset references for every affected project", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "scribes-tui-preferences-"));
+    const store = new ProjectPreferenceStore(join(directory, "preferences.json"));
+    await store.set({
+        projectIdentifier: "one",
+        root: "/work/one",
+        profile: "old-profile",
+        preset: "old-preset",
+    });
+    await store.set({
+        projectIdentifier: "two",
+        root: "/work/two",
+        profile: "other-profile",
+        preset: "old-preset",
+    });
+
+    assert.equal(
+        await store.replaceProfileReferences("old-profile", "new-profile"),
+        1,
+    );
+    assert.equal(
+        await store.replacePresetReferences("old-preset", "new-preset"),
+        2,
+    );
+    const projects = await store.list();
+    assert.equal(projects.find(({ projectIdentifier }) =>
+        projectIdentifier === "one")?.profile, "new-profile");
+    assert.ok(projects.every(({ preset }) => preset === "new-preset"));
+});

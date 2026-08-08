@@ -25,6 +25,7 @@ import {
     ProjectIndexingService,
     ProjectInspectionService,
     ProjectRetrievalTargetService,
+    ProviderProfileRenameService,
     ProjectSearchService,
     ProviderProfileService,
     SqliteStorageProvider,
@@ -78,6 +79,7 @@ export class ScribesTuiApp {
     readonly #cwd: string;
     readonly #preferences: ProjectPreferenceStore;
     readonly #profiles = new ProviderProfileService(apiKeyOptions());
+    readonly #profileRenames = new ProviderProfileRenameService();
     readonly #presets = new IndexingPresetService();
     readonly #indexing = new ProjectIndexingService(apiKeyOptions());
     readonly #search = new ProjectSearchService(apiKeyOptions());
@@ -509,6 +511,7 @@ export class ScribesTuiApp {
             { value: "use", label: "Use for current project" },
             { value: "test", label: "Test connection" },
             { value: "edit", label: "Edit profile" },
+            { value: "rename", label: "Rename" },
             { value: "show", label: "Show configuration" },
             { value: "delete", label: "Delete profile" },
         ]);
@@ -526,6 +529,8 @@ export class ScribesTuiApp {
             this.#append(JSON.stringify(await this.#profiles.diagnose(profile.name), null, 2), "success");
         } else if (action.value === "edit") {
             await this.#editProfile(profile);
+        } else if (action.value === "rename") {
+            await this.#renameProfile(profile);
         } else if (action.value === "show") {
             this.#append(JSON.stringify(profile, null, 2));
         } else if (action.value === "delete") {
@@ -631,6 +636,41 @@ export class ScribesTuiApp {
         this.#append(`Updated profile ${profile.name}.`, "success");
     }
 
+    async #renameProfile(profile: ProviderProfile): Promise<void> {
+        const nextName = (await this.#input(
+            `Rename ${profile.name}`,
+            "New name",
+            profile.name,
+        ))?.trim();
+        if (!nextName || nextName === profile.name) return;
+        const result = await this.#profileRenames.rename(profile.name, nextName);
+        let updatedPreferences = 0;
+        try {
+            updatedPreferences = await this.#preferences.replaceProfileReferences(
+                profile.name,
+                result.profile.name,
+            );
+        } catch (error: unknown) {
+            try {
+                await this.#profileRenames.rename(result.profile.name, profile.name);
+            } catch (rollbackError: unknown) {
+                throw new AggregateError(
+                    [error, rollbackError],
+                    "Profile was renamed but its references could not be fully updated or restored",
+                );
+            }
+            throw error;
+        }
+        this.#activePreference = this.#activeProject
+            ? await this.#preferences.get(this.#activeProject.projectIdentifier)
+            : undefined;
+        this.#append(
+            `Renamed profile ${profile.name} to ${result.profile.name}; updated ${result.updatedPresets} preset(s), ${result.updatedProjectRecipes} project recipe(s), and ${updatedPreferences} TUI project preference(s).`,
+            "success",
+        );
+        this.#updateHeader();
+    }
+
     async #managePresets(argument = ""): Promise<void> {
         const presets = await this.#presets.list();
         const direct = argument ? presets.find(({ name }) => name === argument) : undefined;
@@ -651,6 +691,7 @@ export class ScribesTuiApp {
         const action = await this.#pick(preset.name, [
             { value: "use", label: "Use for current project" },
             { value: "edit", label: "Edit preset" },
+            { value: "rename", label: "Rename" },
             { value: "show", label: "Show configuration" },
             { value: "delete", label: "Delete preset" },
         ]);
@@ -665,6 +706,8 @@ export class ScribesTuiApp {
             this.#updateHeader();
         } else if (action.value === "edit") {
             await this.#editPreset(preset);
+        } else if (action.value === "rename") {
+            await this.#renamePreset(preset);
         } else if (action.value === "show") {
             this.#append(JSON.stringify(preset, null, 2));
         } else if (action.value === "delete") {
@@ -738,6 +781,41 @@ export class ScribesTuiApp {
             ...(splitPatterns(excludeText).length === 0 ? {} : { exclude: splitPatterns(excludeText) }),
         });
         this.#append(`Updated preset ${preset.name}.`, "success");
+    }
+
+    async #renamePreset(preset: IndexingPreset): Promise<void> {
+        const nextName = (await this.#input(
+            `Rename ${preset.name}`,
+            "New name",
+            preset.name,
+        ))?.trim();
+        if (!nextName || nextName === preset.name) return;
+        const renamed = await this.#presets.rename(preset.name, nextName);
+        let updatedPreferences = 0;
+        try {
+            updatedPreferences = await this.#preferences.replacePresetReferences(
+                preset.name,
+                renamed.name,
+            );
+        } catch (error: unknown) {
+            try {
+                await this.#presets.rename(renamed.name, preset.name);
+            } catch (rollbackError: unknown) {
+                throw new AggregateError(
+                    [error, rollbackError],
+                    "Preset was renamed but its references could not be fully updated or restored",
+                );
+            }
+            throw error;
+        }
+        this.#activePreference = this.#activeProject
+            ? await this.#preferences.get(this.#activeProject.projectIdentifier)
+            : undefined;
+        this.#append(
+            `Renamed preset ${preset.name} to ${renamed.name}; updated ${updatedPreferences} TUI project preference(s).`,
+            "success",
+        );
+        this.#updateHeader();
     }
 
     async #browseBuilds(): Promise<void> {

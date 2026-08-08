@@ -72,6 +72,50 @@ export class ProjectPreferenceStore {
         });
     }
 
+    async replaceProfileReferences(
+        currentName: string,
+        nextName: string,
+    ): Promise<number> {
+        const current = required(currentName, "current profile");
+        const next = required(nextName, "new profile");
+        if (current === next) return 0;
+        const file = await this.#read();
+        const count = file.projects.filter(({ profile }) => profile === current).length;
+        if (count === 0) return 0;
+        const now = new Date().toISOString();
+        await this.#write({
+            schemaVersion: 1,
+            projects: file.projects.map((project) =>
+                project.profile === current
+                    ? { ...project, profile: next, updatedAt: now }
+                    : project
+            ),
+        });
+        return count;
+    }
+
+    async replacePresetReferences(
+        currentName: string,
+        nextName: string,
+    ): Promise<number> {
+        const current = required(currentName, "current preset");
+        const next = required(nextName, "new preset");
+        if (current === next) return 0;
+        const file = await this.#read();
+        const count = file.projects.filter(({ preset }) => preset === current).length;
+        if (count === 0) return 0;
+        const now = new Date().toISOString();
+        await this.#write({
+            schemaVersion: 1,
+            projects: file.projects.map((project) =>
+                project.preset === current
+                    ? { ...project, preset: next, updatedAt: now }
+                    : project
+            ),
+        });
+        return count;
+    }
+
     async #read(): Promise<ProjectPreferencesFile> {
         try {
             const value = JSON.parse(await readFile(this.#path, "utf8")) as unknown;
