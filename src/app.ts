@@ -50,6 +50,7 @@ import { SearchResultsComponent } from "./components/search-results.js";
 import { TextPrompt } from "./components/text-prompt.js";
 import type { ProjectPreference } from "./domain/project-preferences.js";
 import { ProjectPreferenceStore } from "./services/preference-store.js";
+import { formatError } from "./services/error-formatter.js";
 import { projectForDirectory } from "./services/project-context.js";
 import { colors, editorTheme } from "./theme.js";
 
@@ -1274,8 +1275,7 @@ export class ScribesTuiApp {
     }
 
     #appendError(error: unknown): void {
-        const message = error instanceof Error ? error.message : String(error);
-        this.#append(`Error: ${message}`, "warning");
+        this.#append(formatError(error), "warning");
     }
 
     async #pick(title: string, items: readonly SelectItem[]): Promise<SelectItem | undefined> {

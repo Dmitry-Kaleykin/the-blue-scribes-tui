@@ -72,7 +72,7 @@ in `$VISUAL` or `$EDITOR`, and `Escape` returns focus to the editor.
 | `/collection` | Creates collections; adds, tags, inspects, or removes sources; indexes collections with live progress; and searches them. |
 | `/jobs` | Shows the current indexing phase and elapsed time. |
 | `/mcp` | Prints read-only MCP configuration for the active project. |
-| `/doctor` | Tests the active or selected provider profile. |
+| `/doctor` | Tests the active or selected provider profile and displays the complete nested cause when it fails. |
 | `/settings` | Shows terminal interaction settings and shortcuts. |
 | `/help` | Shows commands and keyboard shortcuts. |
 | `/clear` | Clears the visible TUI transcript. |
