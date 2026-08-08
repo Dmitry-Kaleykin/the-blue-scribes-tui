@@ -51,6 +51,7 @@ import { TextPrompt } from "./components/text-prompt.js";
 import type { ProjectPreference } from "./domain/project-preferences.js";
 import { ProjectPreferenceStore } from "./services/preference-store.js";
 import { formatError } from "./services/error-formatter.js";
+import { shouldRenderIndexingProgressImmediately } from "./services/indexing-render-policy.js";
 import { projectForDirectory } from "./services/project-context.js";
 import { colors, editorTheme } from "./theme.js";
 
@@ -317,7 +318,7 @@ export class ScribesTuiApp {
                 provider: { type: "profile", profile: configuration.profile },
                 target: configuration.target,
                 keepReplacedBuilds: configuration.keepReplacedBuilds ?? 1,
-                ...(configuration.allowDirty ? { allowDirty: true } : {}),
+                ...(configuration.allowDirty === true ? { allowDirty: true } : {}),
                 ...(configuration.presetValue.maximumChunkSize === undefined
                     ? {}
                     : { maximumChunkSize: configuration.presetValue.maximumChunkSize }),
@@ -371,8 +372,13 @@ export class ScribesTuiApp {
                     : "Provider ready",
             });
         } else if (event.type === "indexing-progress") {
+            const previousProgress = this.#activeJob.progress;
             this.#activeJob.progress = event.progress;
             this.#progress.setState({ stage: "indexing", progress: event.progress });
+            if (shouldRenderIndexingProgressImmediately(previousProgress, event.progress)) {
+                this.#ui.renderNow();
+                return;
+            }
         } else if (event.type === "target-publication") {
             this.#progress.setState({ stage: "provider", message: `Publishing target ${event.target}` });
         }
